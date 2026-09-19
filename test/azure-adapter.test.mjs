@@ -1,0 +1,8 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {chatToResponses,chatToAnthropic,routeModel,sseEvents} from '../src/azure-adapter.mjs';
+const body={messages:[{role:'system',content:'Instruction'},{role:'user',content:'Check'},{role:'assistant',content:null,tool_calls:[{id:'call_1',type:'function',function:{name:'read_file',arguments:'{"path":"test.txt"}'}}]},{role:'tool',tool_call_id:'call_1',content:'file contents'}],tools:[{type:'function',function:{name:'read_file',parameters:{type:'object',properties:{path:{type:'string'}}}}}]};
+test('Responses preserves assistant tool calls and matching outputs',()=>{const r=chatToResponses(body);assert.equal(r.input[2].call_id,'call_1');assert.equal(r.input[3].call_id,'call_1');assert.equal(r.input[3].output,'file contents');assert.equal(r.input[0].role,'system');assert.equal(r.tools[0].name,'read_file');});
+test('Anthropic preserves tool call arguments and result linkage',()=>{const r=chatToAnthropic(body);assert.equal(r.system[0].text,'Instruction');assert.deepEqual(r.messages[1].content[0].input,{path:'test.txt'});assert.equal(r.messages[2].content[0].tool_use_id,'call_1');});
+test('route selection fails closed and never falls back to a different model',()=>{assert.equal(routeModel('azure-opus').deployment,'claude-opus-5');assert.equal(routeModel('azure-astra').deployment,'gpt-6-astra');assert.throws(()=>routeModel('gpt-4.1'));});
+test('SSE parser handles split UTF8 and frame boundaries',async()=>{const b=new TextEncoder().encode('event: test\ndata: {"text":"héllo"}\n\ndata: [DONE]\n\n');async function* chunks(){for(let i=0;i<b.length;i++)yield b.slice(i,i+1);}const rows=[];for await(const x of sseEvents(chunks()))rows.push(x);assert.deepEqual(rows,[{text:'héllo'}]);});

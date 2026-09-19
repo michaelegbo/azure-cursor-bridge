@@ -1,0 +1,112 @@
+{
+  "name": "azure-cursor-bridge",
+  "version": "3.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Azure GPT-6 Astra and Claude Opus 5 bridge for Cursor and Codex",
+  "main": "electron/main.mjs",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "app": "electron .",
+    "test": "node --test test/*.test.mjs",
+    "vendor": "node build/download-cloudflared.cjs",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "electron": "^44.1.0",
+    "electron-builder": "26.0.12",
+    "playwright-core": "^1.55.0"
+  },
+  "build": {
+    "appId": "com.local.codexcursorbridge",
+    "productName": "Azure Cursor Bridge",
+    "artifactName": "Azure-Cursor-Bridge-${version}-${os}-${arch}.${ext}",
+    "asar": false,
+    "afterPack": "build/after-pack.cjs",
+    "directories": {
+      "app": "electron",
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "src",
+        "to": "bridge/src"
+      },
+      {
+        "from": "package.json",
+        "to": "bridge/package.json"
+      }
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        "nsis"
+      ],
+      "extraResources": [
+        {
+          "from": "vendor/win32",
+          "to": "bridge/vendor"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "shortcutName": "Azure Cursor Bridge"
+    },
+    "mac": {
+      "icon": "icon.png",
+      "category": "public.app-category.developer-tools",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "vendor/darwin",
+          "to": "bridge/vendor"
+        }
+      ]
+    },
+    "linux": {
+      "icon": "icon.png",
+      "category": "Development",
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "extraResources": [
+        {
+          "from": "vendor/linux",
+          "to": "bridge/vendor"
+        }
+      ]
+    }
+  }
+}

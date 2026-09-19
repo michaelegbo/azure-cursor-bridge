@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+ <meta charset="utf-8">
+ <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
+ <title>Azure Cursor Bridge</title>
+ <style>
+  *{box-sizing:border-box}
+  body{margin:0;background:#111315;color:#eee;font:15px/1.5 Segoe UI,sans-serif}
+  main{max-width:1060px;margin:0 auto;padding:36px}
+  header{display:flex;justify-content:space-between;align-items:center;margin-bottom:32px}
+  .brand{display:flex;align-items:center;gap:16px}
+  .app-icon{width:54px;height:54px;object-fit:contain;filter:drop-shadow(0 8px 18px rgba(0,229,196,.18))}
+  h1{font-size:28px;margin:0;font-weight:600}
+  h2{font-size:18px;margin:0 0 12px}
+  p{color:#b8bec4;margin:6px 0 0}
+  .status{border:1px solid #4b535b;padding:6px 14px;border-radius:20px;transition:color .22s ease,border-color .22s ease}
+  .on{color:#8ae0b6;border-color:#35624b}
+  .models{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:24px 0}
+  .panel{background:#191d21;border:1px solid #343b41;border-radius:10px;padding:22px}
+  .modelname{font-size:21px;margin-bottom:10px}
+  code{font:14px Consolas,monospace;color:#a6d6f9;overflow-wrap:anywhere}
+  button{font:inherit;color:#e8eef4;background:#29333b;border:1px solid #50606d;border-radius:6px;padding:8px 14px;cursor:pointer}
+  button:hover{background:#36434d}
+  button:focus-visible{outline:2px solid #85c9ff;outline-offset:3px}
+  button:disabled{cursor:wait;opacity:.65}
+  .actions{display:flex;align-items:center;gap:10px;margin-top:16px;flex-wrap:wrap}
+  .bridge-toggle{display:inline-flex;align-items:center;gap:9px;min-width:114px;justify-content:center;transition:background .22s ease,border-color .22s ease,color .22s ease}
+  .bridge-toggle.is-on{color:#071a13;background:#8ae0b6;border-color:#8ae0b6}
+  .bridge-toggle.is-on:hover{background:#a1e8c4}
+  .toggle-track{position:relative;width:32px;height:18px;border-radius:999px;background:#11171b;box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);transition:background .22s ease}
+  .toggle-knob{position:absolute;top:3px;left:3px;width:12px;height:12px;border-radius:50%;background:#d6dde2;transition:transform .24s cubic-bezier(.2,.8,.2,1),background .22s ease,box-shadow .22s ease}
+  .bridge-toggle.is-on .toggle-track{background:#176146}
+  .bridge-toggle.is-on .toggle-knob{transform:translateX(14px);background:#fff;box-shadow:0 0 9px rgba(255,255,255,.65)}
+  .bridge-toggle.is-busy .toggle-knob{animation:toggle-working .72s ease-in-out infinite alternate}
+  .toggle-label{min-width:47px;text-align:left}
+  #message{min-height:24px;color:#a6d6f9;margin-top:10px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:12px 8px;border-bottom:1px solid #333b41}
+  th{color:#a8b5c1;font-weight:500}
+  td:last-child{overflow-wrap:anywhere;max-width:360px}
+  .ok{color:#8ae0b6}
+  .failed{color:#ffad9c}
+  .empty{padding:22px 0;color:#adb6bf}
+  label{display:block;margin-top:16px}
+  select{display:block;width:100%;margin:6px 0 12px;padding:8px;background:#222c34;color:#eee;border:1px solid #647582;border-radius:5px;font:inherit}
+  section.panel{margin-bottom:16px}
+  .kv{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:baseline;margin:8px 0}
+  .kv span{color:#a8b5c1;font-size:13px}
+  details{margin-top:12px;border:1px solid #343b41;border-radius:8px;padding:10px 14px;background:#14181c}
+  details summary{cursor:pointer;color:#a6d6f9;font-weight:500}
+  details[open] summary{margin-bottom:8px}
+  details ol{margin:6px 0;padding-left:22px;color:#b8bec4}
+  details li{margin:4px 0}
+  pre{background:#0d1114;border:1px solid #2a3238;border-radius:6px;padding:12px;font:13px Consolas,monospace;color:#a6d6f9;overflow-x:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0}
+  textarea{display:block;width:100%;margin:6px 0 12px;padding:8px;background:#222c34;color:#eee;border:1px solid #647582;border-radius:5px;font:inherit;resize:vertical}
+  .play-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .play-grid label{margin-top:8px}
+  #play-status.ok{color:#8ae0b6}
+  #play-status.failed{color:#ffad9c}
+  @media(max-width:880px){.play-grid{grid-template-columns:1fr}.kv{grid-template-columns:1fr}}
+  .req-row{cursor:pointer}
+  .req-row:hover td{background:#1e242a}
+  .req-row.open td{background:#1e242a}
+  .detail-row td{background:#14181c;max-width:none;padding:16px 12px}
+  .detail-wrap p{margin:4px 0;color:#b8bec4;font-size:13px}
+  .group-line{color:#cdd6dd !important}
+  .bar{display:flex;height:10px;border-radius:5px;overflow:hidden;margin:10px 0;background:#0d1114}
+  .bar span{display:block;height:100%}
+  .msg-list{max-height:220px;overflow-y:auto;border:1px solid #2a3238;border-radius:6px;padding:8px;margin:8px 0}
+  .msg{font:12px Consolas,monospace;color:#9aa7b2;padding:3px 0;overflow-wrap:anywhere;border-bottom:1px solid #1c2228}
+  .msg b{color:#a6d6f9;font-weight:600}
+  .analysis{white-space:pre-wrap;border-left:3px solid #5b8dd9;padding:6px 0 6px 12px;color:#cdd6dd !important;margin-top:10px !important}
+  .actions input[type=text],.actions select{display:inline-block;width:auto;margin:0;padding:8px;background:#222c34;color:#eee;border:1px solid #647582;border-radius:5px;font:inherit}
+  button.mini{padding:4px 10px;font-size:12px;margin-right:6px}
+  #keys-message{min-height:20px;color:#a6d6f9;margin-top:10px}
+  .pricing-grid{margin-top:16px}
+  .pricing-row{display:grid;grid-template-columns:220px repeat(3,1fr);gap:12px;align-items:end;margin-bottom:10px}
+  .pricing-row>span{color:#cdd6dd;padding-bottom:9px}
+  .pricing-row label{margin:0;font-size:12px;color:#a8b5c1}
+  .pricing-row input{display:block;width:100%;margin-top:4px;padding:7px;background:#222c34;color:#eee;border:1px solid #647582;border-radius:5px;font:inherit}
+  #price-message{color:#a6d6f9}
+  @media(max-width:880px){.pricing-row{grid-template-columns:1fr 1fr}}
+  #az-new,#az-endpoint-input{display:block;width:100%;margin:6px 0 12px;padding:8px;background:#222c34;color:#eee;border:1px solid #647582;border-radius:5px;font:inherit}
+  #az-revealed{user-select:all}
+  #az-message{color:#a6d6f9}
+  #nav{position:sticky;top:0;z-index:10;display:flex;gap:6px;flex-wrap:wrap;background:#111315;padding:10px 0 14px;border-bottom:1px solid #2a3238;margin-bottom:20px}
+  #nav button{background:transparent;border:1px solid transparent;color:#a8b5c1;padding:7px 14px}
+  #nav button:hover{background:#1e242a;color:#e8eef4}
+  #nav button.active{background:#29333b;border-color:#50606d;color:#e8eef4}
+  .page{display:none}
+  .page.active{display:block}
+  #wizard{position:fixed;inset:0;background:rgba(10,12,14,.82);display:flex;align-items:center;justify-content:center;z-index:100}
+  #wizard[hidden]{display:none}
+  .wizard-card{background:#191d21;border:1px solid #3a444c;border-radius:12px;padding:30px;max-width:560px;width:92%;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+  .wizard-card h2{margin-top:0}
+  .wizard-card input{display:block;width:100%;margin:6px 0 14px;padding:9px;background:#222c34;color:#eee;border:1px solid #647582;border-radius:5px;font:inherit}
+  .wizard-hint{font-size:13px;color:#8d99a5}
+  #wiz-message{color:#a6d6f9}
+  .mini-bar{height:6px;border-radius:3px;background:#5b8dd9;min-width:2px}
+  @keyframes toggle-working{to{transform:translateX(14px)}}
+  @media(prefers-reduced-motion:reduce){.status,.bridge-toggle,.toggle-track,.toggle-knob{transition:none}.bridge-toggle.is-busy .toggle-knob{animation:none}}
+  @media(max-width:880px){main{padding:24px}.models{grid-template-columns:1fr}header{align-items:flex-start;gap:12px}.app-icon{width:46px;height:46px}}
+ </style>
+</head>
+<body>
+ <main>
+  <header>
+   <div class="brand"><img class="app-icon" src="icon.png" alt=""><div><h1>Azure Cursor Bridge</h1><p>Your Azure models, ready for Cursor and Codex.</p></div></div>
+   <span class="status" id="status">Checking connection</span>
+  </header>
+  <nav id="nav">
+   <button data-page="overview" class="active">Overview</button>
+   <button data-page="playground">Playground</button>
+   <button data-page="access">Access keys</button>
+   <button data-page="azure">Azure</button>
+   <button data-page="usage">Usage &amp; cost</button>
+   <button data-page="requests">Requests</button>
+   <button data-page="docs">Docs</button>
+  </nav>
+  <div class="page active" data-page="overview">
+  <section class="panel">
+   <h2>Cursor connection</h2>
+   <code id="url">Loading endpoint…</code>
+   <div class="actions">
+    <button data-action="copy-url">Copy base URL</button>
+    <button data-action="copy-key">Copy bridge key</button>
+    <button class="bridge-toggle" id="bridge-toggle" data-action="toggle" data-next-action="start" type="button" role="switch" aria-checked="false" aria-label="Start bridge"><span class="toggle-track" aria-hidden="true"><span class="toggle-knob"></span></span><span class="toggle-label">Start</span></button>
+    <button data-action="restart">Restart bridge</button>
+   </div>
+   <div id="message" role="status"></div>
+   <p>This is a permanent URL — it stays the same across restarts and reboots. Use it as the OpenAI base URL override in Cursor and the provider base URL in Codex. Keep this computer on while using the bridge.</p>
+  </section>
+  <section class="models">
+   <article class="panel">
+    <div class="modelname">GPT-6 Astra</div><code>azure-astra</code><p>Azure deployment: gpt-6-astra</p>
+    <label for="astra-effort">Reasoning mode</label><select id="astra-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select>
+    <p>Maximum context: 1,050,000 tokens (up to 922,000 input)</p><p>Output allowance: up to 128,000 tokens</p>
+   </article>
+   <article class="panel">
+    <div class="modelname">Claude Opus 5</div><code>azure-opus</code><p>Azure deployment: claude-opus-5</p>
+    <label for="opus-effort">Reasoning mode</label><select id="opus-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select>
+    <p>Maximum context: 1,000,000 tokens</p><p>Output allowance: up to 128,000 tokens</p>
+   </article>
+  </section>
+  <section class="panel">
+   <button id="save-settings">Save model settings</button>
+   <p id="settings-message" role="status">Changes apply to the next request. Higher effort can take longer and use more tokens.</p>
+   <p>These are defaults for bare model names. Clients can override per request — effort-suffixed models in Cursor (e.g. <code>azure-astra-high</code>), the reasoning selector in Codex. See “Control reasoning effort” under Endpoint details.</p>
+   <p>Full Azure context is available through the bridge. Cursor controls the history it sends and may compact earlier. No local truncation is applied.</p>
+  </section>
+  </div>
+  <div class="page" data-page="docs">
+  <section class="panel">
+   <h2>Endpoint details</h2>
+   <div class="kv"><span>Public base URL</span><code id="detail-public">—</code></div>
+   <div class="kv"><span>Local base URL</span><code id="detail-local">—</code></div>
+   <div class="kv"><span>Authentication</span><code>Authorization: Bearer &lt;owner key or guest key&gt;</code></div>
+   <div class="kv"><span>Tunnel</span><code id="detail-tunnel">—</code></div>
+   <p>Routes: <code>GET /health</code> (no auth) · <code>GET /v1/models</code> · <code>POST /v1/chat/completions</code> · <code>POST /v1/responses</code>. Models: <code>azure-astra</code> (GPT-6 Astra) and <code>azure-opus</code> (Claude Opus 5). Add an effort suffix to pick reasoning per request — <code>azure-astra-low</code>, <code>azure-opus-max</code>, etc. (low / medium / high / xhigh / max). Bare model names use the Reasoning mode saved above; a client-sent reasoning setting (Codex) is honored too.</p>
+   <details>
+    <summary>Connect Cursor</summary>
+    <ol>
+     <li>Cursor Settings → Models → API Keys: enable <b>OpenAI API Key</b> and paste the bridge key (use “Copy bridge key” above).</li>
+     <li>Turn on <b>Override OpenAI Base URL</b> and paste the public base URL (use “Copy base URL” above).</li>
+     <li>Add custom models named <code>azure-astra</code> and <code>azure-opus</code>, then pick one in chat.</li>
+     <li>To control reasoning from Cursor's model picker, add effort-suffixed names like <code>azure-astra-high</code> or <code>azure-opus-max</code> — the suffix overrides the bridge's default effort for that request.</li>
+    </ol>
+   </details>
+   <details>
+    <summary>Connect Codex</summary>
+    <p>In <code>~/.codex/config.toml</code>, point the provider at the bridge and select a bridge model:</p>
+    <pre id="doc-codex"></pre>
+    <p>Set the <code>AZURE_CURSOR_BRIDGE_API_KEY</code> environment variable to the bridge key.</p>
+   </details>
+   <details>
+    <summary>Control reasoning effort</summary>
+    <p>Both models support five reasoning levels: <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code> and <code>max</code>. Higher levels think longer and use more output tokens. There are three ways to choose, and the most specific one wins:</p>
+    <ol>
+     <li><b>Effort in the model name</b> (strongest) — pick a suffixed model such as <code>azure-astra-low</code>, <code>azure-astra-max</code> or <code>azure-opus-high</code>. This is how you control effort from Cursor's model picker: all ten variants are registered there, alongside the bare names. Works from any OpenAI-compatible client.</li>
+     <li><b>The client's own reasoning setting</b> — Codex has a native effort selector next to the model name and sends your choice with every request; the bridge honors it. API callers can send <code>reasoning_effort</code> (chat) or <code>reasoning.effort</code> (responses).</li>
+     <li><b>The bridge default</b> (weakest) — the Reasoning mode dropdowns above apply when a bare model name is used and the client sends no preference. This is what Cursor's bare <code>azure-astra</code> uses.</li>
+    </ol>
+    <p>Every request's resolved effort is shown in Recent requests below, so you can confirm which level actually ran.</p>
+   </details>
+   <details>
+    <summary>Test from a terminal</summary>
+    <pre id="doc-curl"></pre>
+   </details>
+   <details>
+    <summary>Azure upstream key &amp; versions</summary>
+    <p>The bridge authenticates to Azure with the key shown under “Azure upstream key”. Keys are stored DPAPI-encrypted per version in the bridge state folder; nothing is kept in plain text. <b>Reveal</b> decrypts and shows a key, <b>Test against Azure</b> sends one tiny real request (a few tokens) to confirm Azure accepts it, <b>Save as new version</b> stores a pasted key as the next version and activates it, and <b>Activate</b> on an older version reverts to it. Activation rewrites the key file and restarts the proxy, so the change applies to the next request. The active version can never be deleted.</p>
+   </details>
+   <details>
+    <summary>Cost estimation</summary>
+    <p>The bridge records exact token usage (input, cached input, output) for every request into daily totals, and multiplies them by the rates you save under “Usage &amp; cost”. Cost per request = fresh input × input rate + cached input × cached rate + output × output rate (rates are per 1 million tokens). Azure serves repeated prompt prefixes from its cache at a lower rate, which is why cached input is priced separately — enter the cached rate from your Azure pricing page, or the full input rate if you prefer a conservative estimate. Once rates are saved, each row in Recent requests also shows its estimated cost. These figures are estimates based on the rates you entered; your Azure invoice is authoritative.</p>
+   </details>
+   <details>
+    <summary>Guest keys &amp; owner key rotation</summary>
+    <p>The <b>owner key</b> is stored in the bridge config and never changes on its own — it is permanent until you press Rotate in “API keys &amp; access”. Rotating invalidates the old value on the next request and copies the new one to the clipboard; afterwards paste it into Cursor (as the OpenAI API key) and update the <code>AZURE_CURSOR_BRIDGE_API_KEY</code> environment variable for Codex.</p>
+    <p><b>Guest keys</b> are additional keys for the same endpoint with limits you control: an optional expiry set at creation, an on/off switch, Reset (new value, old one dies instantly), and Delete. The proxy re-checks keys on every request, so all changes are immediate — no restart needed. Each request in Recent requests shows which key authenticated it, with a per-key request counter in the table above.</p>
+   </details>
+   <details>
+    <summary>How the endpoint works</summary>
+    <p>The bridge runs locally on port 17834 and translates OpenAI-style requests to your Azure deployments (<code>gpt-6-astra</code> and <code>claude-opus-5</code>). A named Cloudflare tunnel can publish it at a permanent hostname that survives restarts and reboots; the tunnel token is stored encrypted with the OS keystore. Without a named tunnel, the bridge uses a temporary trycloudflare URL that changes on every start.</p>
+   </details>
+  </section>
+  </div>
+  <div class="page" data-page="playground">
+  <section class="panel">
+   <h2>Test playground</h2>
+   <p>Send a real request through the bridge to verify the endpoint end to end. Requests use your Azure quota and appear under Recent requests.</p>
+   <div class="play-grid">
+    <label>Model<select id="play-model"><option value="azure-astra">GPT-6 Astra (azure-astra)</option><option value="azure-opus">Claude Opus 5 (azure-opus)</option></select></label>
+    <label>Route<select id="play-target"><option value="public">Public URL (through Cloudflare)</option><option value="local">Local (127.0.0.1:17834)</option></select></label>
+   </div>
+   <label for="play-prompt">Prompt</label>
+   <textarea id="play-prompt" rows="3">Reply with one short sentence confirming which model you are.</textarea>
+   <div class="actions"><button id="play-send">Send test request</button><span id="play-status" role="status"></span></div>
+   <pre id="play-response" hidden></pre>
+   <p id="play-meta"></p>
+  </section>
+  </div>
+  <div class="page" data-page="access">
+  <section class="panel" id="access-panel">
+   <h2>API keys &amp; access</h2>
+   <p>The owner key is permanent until you rotate it. Guest keys share the same endpoint but are controlled by you: give them an expiry, turn them off and on, reset their value, or delete them — every change applies to the very next request. Recent requests show which key each request used.</p>
+   <table><thead><tr><th>Label</th><th>Key</th><th>Status</th><th>Expires</th><th>Requests</th><th>Actions</th></tr></thead><tbody id="keys"></tbody></table>
+   <div class="actions">
+    <input id="key-label" type="text" placeholder="Label (e.g. Contractor)" maxlength="40">
+    <select id="key-expiry">
+     <option value="0">No expiry</option>
+     <option value="1">Expires in 1 hour</option>
+     <option value="8">Expires in 8 hours</option>
+     <option value="24">Expires in 24 hours</option>
+     <option value="168">Expires in 7 days</option>
+     <option value="720">Expires in 30 days</option>
+    </select>
+    <button id="key-create">Create guest key</button>
+   </div>
+   <div id="keys-message" role="status"></div>
+  </section>
+  </div>
+  <div class="page" data-page="azure">
+  <section class="panel">
+   <h2>Azure upstream key</h2>
+   <p>The Azure endpoint and API key the bridge uses upstream. Each version snapshots <b>both together</b> — change the key, the endpoint, or both, and revert to any version to restore that exact pair. Keys are stored encrypted with the OS keystore. Saving or activating a version restarts the proxy automatically so it takes effect immediately.</p>
+   <div class="kv"><span>Azure endpoint</span><code id="az-endpoint">—</code></div>
+   <div class="kv"><span>Active key</span><code id="az-active">—</code></div>
+   <div class="actions">
+    <button id="az-reveal">Reveal</button>
+    <button id="az-copy">Copy</button>
+    <button id="az-test">Test against Azure</button>
+   </div>
+   <pre id="az-revealed" hidden></pre>
+   <table><thead><tr><th>Version</th><th>Added</th><th>Key</th><th>Endpoint</th><th>Note</th><th>Status</th><th>Actions</th></tr></thead><tbody id="az-versions"></tbody></table>
+   <label for="az-new">Update key — paste a new Azure API key (saved as a new version and activated)</label>
+   <input id="az-new" type="password" placeholder="Paste new Azure API key" autocomplete="off">
+   <label for="az-endpoint-input">Azure endpoint — your resource origin (change only when moving to another Azure resource)</label>
+   <input id="az-endpoint-input" type="text" placeholder="https://your-resource.services.ai.azure.com" autocomplete="off">
+   <div class="actions"><button id="az-save">Save as new version</button><button id="az-endpoint-save">Save endpoint</button><span id="az-message" role="status"></span></div>
+  </section>
+  </div>
+  <div class="page" data-page="usage">
+  <section class="panel">
+   <h2>Usage &amp; cost</h2>
+   <p>Token totals for everything that passes through the bridge, bucketed per day. Enter <b>your</b> Azure rates in US dollars per 1 million tokens (from the Azure portal / your agreement) and the bridge estimates cost — estimates, not invoices. Counting starts from when this feature was added.</p>
+   <table><thead><tr><th>Period</th><th>Requests</th><th>Tokens in (cached)</th><th>Tokens out</th><th>Est. cost</th></tr></thead><tbody id="usage-rows"></tbody></table>
+   <div class="pricing-grid">
+    <div class="pricing-row"><span>GPT-6 Astra (azure-astra)</span>
+     <label>Input $/1M<input id="price-astra-input" type="number" min="0" step="0.01"></label>
+     <label>Cached input $/1M<input id="price-astra-cached" type="number" min="0" step="0.01"></label>
+     <label>Output $/1M<input id="price-astra-output" type="number" min="0" step="0.01"></label>
+    </div>
+    <div class="pricing-row"><span>Claude Opus 5 (azure-opus)</span>
+     <label>Input $/1M<input id="price-opus-input" type="number" min="0" step="0.01"></label>
+     <label>Cached input $/1M<input id="price-opus-cached" type="number" min="0" step="0.01"></label>
+     <label>Output $/1M<input id="price-opus-output" type="number" min="0" step="0.01"></label>
+    </div>
+   </div>
+   <div class="actions"><button id="price-save">Save rates</button><span id="price-message" role="status"></span></div>
+  </section>
+  <section class="panel">
+   <h2>Daily history</h2>
+   <p>Per-day totals and estimated spend for the last 30 days, most recent first.</p>
+   <table><thead><tr><th>Day</th><th>Requests</th><th>Tokens in (cached)</th><th>Tokens out</th><th>Est. cost</th><th></th></tr></thead><tbody id="usage-days"></tbody></table>
+   <div id="usage-days-empty" class="empty" hidden>No usage recorded yet.</div>
+  </section>
+  </div>
+  <div class="page" data-page="requests">
+  <section class="panel">
+   <h2>Recent requests</h2><p>Click a request to see what made it up — where it came from, scaffolding vs conversation, Azure cache hits — and analyze it with AI. API keys are never logged; short prompt previews are kept locally on this computer for the breakdown.</p>
+   <table><thead><tr><th>Time</th><th>Source</th><th>Model</th><th>Result</th><th>Tokens in (cached) / out</th></tr></thead><tbody id="requests"></tbody></table>
+   <div id="empty" class="empty">No requests yet. Send a message from Cursor, Codex, or the playground to test the connection.</div>
+  </section>
+  </div>
+ </main>
+ <div id="wizard" hidden>
+  <div class="wizard-card">
+   <h2>Welcome to Azure Cursor Bridge</h2>
+   <p>Connect your Azure AI resource to get started. Both values stay on this computer, encrypted with your operating system's keystore, and become version 1 of your Azure configuration.</p>
+   <label for="wiz-endpoint">Azure endpoint (your resource origin)</label>
+   <input id="wiz-endpoint" type="text" placeholder="https://your-resource.services.ai.azure.com" autocomplete="off">
+   <label for="wiz-key">Azure API key</label>
+   <input id="wiz-key" type="password" placeholder="Paste your Azure API key" autocomplete="off">
+   <p class="wizard-hint">Find both in the Azure portal under your Azure AI Foundry resource → Keys and Endpoint. The bridge needs deployments named <code>gpt-6-astra</code> and <code>claude-opus-5</code>.</p>
+   <div class="actions">
+    <button id="wiz-save">Save &amp; start</button>
+    <button id="wiz-skip">Configure later</button>
+    <span id="wiz-message" role="status"></span>
+   </div>
+  </div>
+ </div>
+ <script src="renderer.js"></script>
+</body>
+</html>
