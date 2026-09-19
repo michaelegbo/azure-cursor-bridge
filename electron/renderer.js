@@ -130,7 +130,7 @@ function renderCustomModels(models){
  tbody.replaceChildren();
  for(const m of custom){
   const tr=document.createElement('tr');
-  for(const value of [m.id,m.label||m.id,m.deployment,m.protocol==='anthropic'?'Anthropic':'OpenAI',(m.contextWindow||0).toLocaleString(),m.defaultEffort||'medium']){
+  for(const value of [m.id,m.label||m.id,m.deployment,{responses:'OpenAI',anthropic:'Anthropic',chat:'Chat completions'}[m.protocol]||m.protocol,(m.contextWindow||0).toLocaleString(),m.defaultEffort||'medium']){
    const td=document.createElement('td');
    td.textContent=value;
    tr.append(td);

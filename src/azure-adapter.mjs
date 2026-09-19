@@ -99,22 +99,38 @@ export async function* sseEvents(stream) {
   }
 }
 export async function runAzure({body,protocol,route,key,endpoint,signal,sink,preferences={}}) {
-  let payload=route.protocol==='responses' ? (protocol==='chat'?chatToResponses(body):{...body,store:false}) : chatToAnthropic(protocol==='chat'?body:responsesToChat(body));
-  payload.model=route.deployment;payload.stream=true;
+  let payload;
   const effort=resolveEffort(body,route,preferences);
-  if(route.protocol==='anthropic'){payload.output_config={effort};payload.thinking={type:'adaptive'};payload.max_tokens=outputLimit(body,route);}
-  if(route.protocol==='responses') {
-    payload.max_output_tokens=outputLimit(body,route);
-    payload.reasoning={effort};
-    delete payload.previous_response_id;
+  if(route.protocol==='chat'){
+    // Azure deployment-scoped chat completions, for deployments that do not
+    // support the Responses API (e.g. model-router).
+    const base=protocol==='chat'?body:responsesToChat(body);
+    payload={model:route.deployment,messages:base.messages,stream:true,stream_options:{include_usage:true}};
+    if(base.tools?.length)payload.tools=base.tools;
+    if(base.tool_choice)payload.tool_choice=base.tool_choice;
+    if(body.parallel_tool_calls!==undefined)payload.parallel_tool_calls=body.parallel_tool_calls;
+    // Routed targets have different output caps, so only forward limits and
+    // effort the client explicitly asked for.
+    const requestedLimit=body.max_output_tokens??body.max_completion_tokens??body.max_tokens;
+    if(requestedLimit)payload.max_completion_tokens=outputLimit(body,route);
+    if(route.effort??body.reasoning?.effort??body.reasoning_effort)payload.reasoning_effort=effort;
+  }else{
+    payload=route.protocol==='responses' ? (protocol==='chat'?chatToResponses(body):{...body,store:false}) : chatToAnthropic(protocol==='chat'?body:responsesToChat(body));
+    payload.model=route.deployment;payload.stream=true;
+    if(route.protocol==='anthropic'){payload.output_config={effort};payload.thinking={type:'adaptive'};payload.max_tokens=outputLimit(body,route);}
+    if(route.protocol==='responses') {
+      payload.max_output_tokens=outputLimit(body,route);
+      payload.reasoning={effort};
+      delete payload.previous_response_id;
+    }
   }
-  const url=endpoint+(route.protocol==='responses'?'/openai/responses?api-version=2025-04-01-preview':'/anthropic/v1/messages');
+  const url=endpoint+(route.protocol==='responses'?'/openai/responses?api-version=2025-04-01-preview':route.protocol==='chat'?`/openai/deployments/${encodeURIComponent(route.deployment)}/chat/completions?api-version=2025-01-01-preview`:'/anthropic/v1/messages');
   // Azure throttles concurrent requests on a shared deployment quota (429).
   // Nothing has been streamed to the client yet, so waiting and retrying is
   // safe and turns a dead agent turn into a short pause.
   let upstream;
   for(let attempt=0;;attempt++){
-    upstream=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...(route.protocol==='responses'?{'api-key':key}:{'x-api-key':key,'anthropic-version':'2023-06-01'})},body:JSON.stringify(payload),signal});
+    upstream=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...(route.protocol==='anthropic'?{'x-api-key':key,'anthropic-version':'2023-06-01'}:{'api-key':key})},body:JSON.stringify(payload),signal});
     if(upstream.ok)break;
     const retryable=upstream.status===429||upstream.status>=500;
     if(!retryable||attempt>=3){let e=await upstream.json().catch(()=>({}));throw new BridgeError(e.error?.message||`Azure HTTP ${upstream.status}`,upstream.status);}
@@ -126,7 +142,22 @@ export async function runAzure({body,protocol,route,key,endpoint,signal,sink,pre
   }
   sink.open({model:route.id,upstreamModel:route.deployment,provider:'azure',routeMode:route.protocol,responseId:`resp_${crypto.randomUUID().replaceAll('-','')}`});
   let hasTools=false,completed=false;const blocks=new Map();
+  const chatTools=new Map();
   for await(const event of sseEvents(upstream.body)) {
+    if(event.object==='chat.completion.chunk'){
+      const choice=event.choices?.[0];
+      if(choice?.delta?.content)sink.text(choice.delta.content);
+      for(const tc of choice?.delta?.tool_calls||[]){
+        const cur=chatTools.get(tc.index??0)??{id:null,name:'',args:''};
+        if(tc.id)cur.id=tc.id;
+        if(tc.function?.name)cur.name+=tc.function.name;
+        if(tc.function?.arguments)cur.args+=tc.function.arguments;
+        chatTools.set(tc.index??0,cur);
+      }
+      if(choice?.finish_reason)completed=true;
+      if(event.usage)sink.session.usage={inputTokens:event.usage.prompt_tokens||0,outputTokens:event.usage.completion_tokens||0,cachedTokens:event.usage.prompt_tokens_details?.cached_tokens||0};
+      continue;
+    }
     if(event.type==='error'||event.type==='response.failed')throw new BridgeError(event.error?.message||event.response?.error?.message||'Azure stream failed',502);
     if(event.type==='response.output_text.delta')sink.text(event.delta);
     if(event.type==='response.output_item.done'&&event.item?.type==='function_call'){hasTools=true;sink.tool({callId:event.item.call_id,name:event.item.name,arguments:JSON.parse(event.item.arguments)});}
@@ -138,6 +169,13 @@ export async function runAzure({body,protocol,route,key,endpoint,signal,sink,pre
     if(event.type==='content_block_stop'){const b=blocks.get(event.index);if(b?.type==='tool_use'){hasTools=true;sink.tool({callId:b.id,name:b.name,arguments:b.json?JSON.parse(b.json):b.input});}}
     if(event.type==='message_delta'){if(event.usage)sink.session.usage.outputTokens=event.usage.output_tokens;if(event.delta?.stop_reason==='max_tokens')throw new BridgeError('Azure Opus reached the output token limit',502);}
     if(event.type==='message_stop')completed=true;
+  }
+  if(chatTools.size){
+    hasTools=true;
+    for(const t of chatTools.values()){
+      let args;try{args=t.args?JSON.parse(t.args):{};}catch{args={};}
+      sink.tool({callId:t.id||`call_${crypto.randomUUID().replaceAll('-','').slice(0,24)}`,name:t.name,arguments:args});
+    }
   }
   if(!completed)throw new BridgeError('Azure stream ended before completion',502);
   if(hasTools)sink.completeForTool();else sink.complete();

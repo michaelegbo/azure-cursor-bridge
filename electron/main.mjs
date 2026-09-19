@@ -127,7 +127,7 @@ ipcMain.handle('azure:models', async (_e, cmd) => {
     const deployment = String(cmd.model?.deployment || '').trim();
     if (!deployment || deployment.length > 80) throw Error('Enter the Azure deployment name');
     const protocol = cmd.model?.protocol;
-    if (!['responses', 'anthropic'].includes(protocol)) throw Error('Pick the API protocol: responses (OpenAI models) or anthropic (Claude models)');
+    if (!['responses', 'anthropic', 'chat'].includes(protocol)) throw Error('Pick the API protocol: responses (OpenAI models), anthropic (Claude models), or chat (chat-completions-only deployments like model-router)');
     const contextWindow = Number(cmd.model?.contextWindow) || 1000000;
     if (contextWindow < 1000 || contextWindow > 10000000) throw Error('Context window must be between 1,000 and 10,000,000 tokens');
     const maxOutputTokens = Number(cmd.model?.maxOutputTokens) || 128000;

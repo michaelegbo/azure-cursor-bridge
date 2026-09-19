@@ -163,7 +163,7 @@
     <label>Model id<input id="cm-id" placeholder="azure-haiku" maxlength="40"></label>
     <label>Label<input id="cm-label" placeholder="Azure · Claude Haiku" maxlength="60"></label>
     <label>Azure deployment name<input id="cm-deployment" placeholder="claude-haiku-4-5" maxlength="80"></label>
-    <label>Protocol<select id="cm-protocol"><option value="responses">OpenAI (responses)</option><option value="anthropic">Anthropic (messages)</option></select></label>
+    <label>Protocol<select id="cm-protocol"><option value="responses">OpenAI (responses)</option><option value="anthropic">Anthropic (messages)</option><option value="chat">OpenAI chat completions (model-router etc.)</option></select></label>
     <label>Context window<input id="cm-context" type="number" min="1000" max="10000000" value="1000000"></label>
     <label>Max output tokens<input id="cm-maxout" type="number" min="256" max="128000" value="128000"></label>
     <label>Default effort<select id="cm-effort"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label>

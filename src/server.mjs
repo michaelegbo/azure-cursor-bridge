@@ -41,7 +41,7 @@ function registry() {
   let custom = [];
   try { custom = db.settingGet('custom-models') || []; } catch {}
   const extras = (Array.isArray(custom) ? custom : [])
-    .filter(m => m && CUSTOM_ID.test(m.id || '') && m.deployment && ['responses', 'anthropic'].includes(m.protocol) && !taken.has(m.id))
+    .filter(m => m && CUSTOM_ID.test(m.id || '') && m.deployment && ['responses', 'anthropic', 'chat'].includes(m.protocol) && !taken.has(m.id))
     .map(m => ({ id: m.id, deployment: String(m.deployment), label: m.label || m.id, protocol: m.protocol, defaultEffort: m.defaultEffort, contextWindow: Number(m.contextWindow) || 1000000, maxInputTokens: m.maxInputTokens ? Number(m.maxInputTokens) : undefined, maxOutputTokens: Number(m.maxOutputTokens) || 128000 }));
   return [...builtins, ...extras];
 }
