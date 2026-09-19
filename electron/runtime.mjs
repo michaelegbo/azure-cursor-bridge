@@ -52,7 +52,10 @@ export function createRuntime({ stateDir, bridgeRoot, secrets, log }) {
     const child = spawn(file, args, {
       cwd: bridgeRoot,
       env: { ...process.env, ...extraEnv },
-      detached: process.platform !== 'win32',
+      // detached on every platform: otherwise the OS ties the child to the
+      // app process and kills the proxy/tunnel when the app window is closed.
+      // The bridge must keep serving Cursor/Codex with the app closed.
+      detached: true,
       stdio: ['ignore', out, err],
       windowsHide: true,
     });
