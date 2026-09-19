@@ -32,6 +32,20 @@ async function azureEndpoint() {
   return azure.endpoint;
 }
 
+// Built-in models plus user-added models (stored in the database). Custom
+// entries never shadow a built-in id or deployment name.
+const CUSTOM_ID = /^[a-z0-9][a-z0-9-]{1,39}$/;
+function registry() {
+  const builtins = MODELS.map(m => ({ ...m, ...LIMITS[m.id], builtin: true }));
+  const taken = new Set(builtins.flatMap(m => [m.id, m.deployment]));
+  let custom = [];
+  try { custom = db.settingGet('custom-models') || []; } catch {}
+  const extras = (Array.isArray(custom) ? custom : [])
+    .filter(m => m && CUSTOM_ID.test(m.id || '') && m.deployment && ['responses', 'anthropic'].includes(m.protocol) && !taken.has(m.id))
+    .map(m => ({ id: m.id, deployment: String(m.deployment), label: m.label || m.id, protocol: m.protocol, defaultEffort: m.defaultEffort, contextWindow: Number(m.contextWindow) || 1000000, maxInputTokens: m.maxInputTokens ? Number(m.maxInputTokens) : undefined, maxOutputTokens: Number(m.maxOutputTokens) || 128000 }));
+  return [...builtins, ...extras];
+}
+
 const host = '127.0.0.1', port = Number(process.env.AZURE_BRIDGE_PORT || config.port || 17834);
 if (!process.env.AZURE_BRIDGE_PORT) await writeFile(path.join(stateDir, 'proxy.pid'), String(process.pid));
 
@@ -109,21 +123,21 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   let sink, entry;
   try {
-    if (req.method === 'GET' && url.pathname === '/health') return sendJson(res, 200, { status: 'ok', service: 'azure-cursor-bridge', modelCount: MODELS.length, version: '3.0.0' });
+    if (req.method === 'GET' && url.pathname === '/health') return sendJson(res, 200, { status: 'ok', service: 'azure-cursor-bridge', modelCount: registry().length, version: '3.2.0' });
     const who = await auth(req);
     if (!who) throw new BridgeError('Invalid bridge API key', 401);
-    if (req.method === 'GET' && ['/v1/models', '/models'].includes(url.pathname)) return sendJson(res, 200, { object: 'list', data: MODELS.flatMap(m => [{ id: m.id, name: m.label }, ...EFFORTS.map(e => ({ id: `${m.id}-${e}`, name: `${m.label} · ${e}` }))].map(v => ({ id: v.id, object: 'model', created: 1789170000, owned_by: 'azure', name: v.name, context_window: LIMITS[m.id].contextWindow, max_input_tokens: LIMITS[m.id].maxInputTokens, max_output_tokens: 128000, reasoning_efforts: EFFORTS }))) });
+    if (req.method === 'GET' && ['/v1/models', '/models'].includes(url.pathname)) return sendJson(res, 200, { object: 'list', data: registry().flatMap(m => [{ id: m.id, name: m.label }, ...EFFORTS.map(e => ({ id: `${m.id}-${e}`, name: `${m.label} · ${e}` }))].map(v => ({ id: v.id, object: 'model', created: 1789170000, owned_by: 'azure', name: v.name, context_window: m.contextWindow, max_input_tokens: m.maxInputTokens ?? m.contextWindow, max_output_tokens: m.maxOutputTokens || 128000, reasoning_efforts: EFFORTS }))) });
     if (req.method !== 'POST' || !['/v1/chat/completions', '/chat/completions', '/v1/responses', '/responses'].includes(url.pathname)) throw new BridgeError('Not found', 404);
     if (!key) throw new BridgeError('No Azure API key is configured. Set it in the bridge app.', 503);
     const endpoint = await azureEndpoint();
     let bytes = 0; const chunks = []; for await (const chunk of req) { bytes += chunk.length; if (bytes > 32 * 1024 * 1024) throw new BridgeError('Request too large', 413); chunks.push(chunk); }
     let body; try { body = JSON.parse(Buffer.concat(chunks)); } catch { throw new BridgeError('Invalid JSON', 400); }
-    const route = routeModel(body.model), protocol = url.pathname.endsWith('/responses') ? 'responses' : 'chat';
+    const route = routeModel(body.model, registry()), protocol = url.pathname.endsWith('/responses') ? 'responses' : 'chat';
     if (body.previous_response_id) throw new BridgeError('Send the full conversation history; previous_response_id is not supported by this stateless bridge.', 400);
     if (protocol === 'chat' && !Array.isArray(body.messages)) throw new BridgeError('messages must be an array', 400);
     let preferences; try { preferences = settings(db.settingGet('model-settings') || {}); } catch { preferences = settings(); }
     const effort = resolveEffort(body, route, preferences);
-    entry = { effort, contextWindow: LIMITS[route.id].contextWindow, id: randomUUID(), at: new Date().toISOString(), model: route.id, deployment: route.deployment, protocol, bytes, status: 'running', client: clientLabel(req), via: req.headers['cf-connecting-ip'] ? 'public' : 'local', key: who.label };
+    entry = { effort, contextWindow: route.contextWindow, id: randomUUID(), at: new Date().toISOString(), model: route.id, deployment: route.deployment, protocol, bytes, status: 'running', client: clientLabel(req), via: req.headers['cf-connecting-ip'] ? 'public' : 'local', key: who.label };
     const started = Date.now();
     db.upsertRequest(entry);
     recordDetail(entry, body, req);

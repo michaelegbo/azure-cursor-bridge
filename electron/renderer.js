@@ -94,15 +94,102 @@ function renderUsageDays(days){
  }
 }
 
-function loadPricingForm(p){
- if(pricingLoaded)return;
- pricingLoaded=true;
- const map={'price-astra-input':['azure-astra','input'],'price-astra-cached':['azure-astra','cachedInput'],'price-astra-output':['azure-astra','output'],'price-opus-input':['azure-opus','input'],'price-opus-cached':['azure-opus','cachedInput'],'price-opus-output':['azure-opus','output']};
- for(const [id,[model,field]] of Object.entries(map)){
-  const v=p?.[model]?.[field];
-  if(v!==undefined&&v!==null)$(id).value=v;
+let lastModels=[];
+let pricingModelsSig='';
+function renderPricingForm(models,pricing){
+ const sig=(models||[]).map(m=>m.id).join(',');
+ if(sig===pricingModelsSig)return;
+ pricingModelsSig=sig;
+ const grid=$('pricing-grid');
+ grid.replaceChildren();
+ for(const m of models||[]){
+  const row=document.createElement('div');
+  row.className='pricing-row';
+  const name=document.createElement('span');
+  name.textContent=`${m.label||m.id} (${m.id})`;
+  row.append(name);
+  for(const [field,labelText] of [['input','Input $/1M'],['cachedInput','Cached input $/1M'],['output','Output $/1M']]){
+   const label=document.createElement('label');
+   label.textContent=labelText;
+   const input=document.createElement('input');
+   input.type='number';input.min='0';input.step='0.01';
+   input.id=`price-${m.id}-${field}`;
+   const v=pricing?.[m.id]?.[field];
+   if(v!==undefined&&v!==null)input.value=v;
+   label.append(input);
+   row.append(label);
+  }
+  grid.append(row);
  }
 }
+
+function renderCustomModels(models){
+ const custom=(models||[]).filter(m=>!m.builtin);
+ $('custom-empty').hidden=custom.length>0;
+ const tbody=$('custom-models');
+ tbody.replaceChildren();
+ for(const m of custom){
+  const tr=document.createElement('tr');
+  for(const value of [m.id,m.label||m.id,m.deployment,m.protocol==='anthropic'?'Anthropic':'OpenAI',(m.contextWindow||0).toLocaleString(),m.defaultEffort||'medium']){
+   const td=document.createElement('td');
+   td.textContent=value;
+   tr.append(td);
+  }
+  const td=document.createElement('td');
+  const eb=document.createElement('button');
+  eb.className='mini';
+  eb.textContent='Edit';
+  eb.addEventListener('click',()=>{
+   $('cm-id').value=m.id;$('cm-label').value=m.label||'';$('cm-deployment').value=m.deployment;
+   $('cm-protocol').value=m.protocol;$('cm-context').value=m.contextWindow||1000000;
+   $('cm-maxout').value=m.maxOutputTokens||128000;$('cm-effort').value=m.defaultEffort||'medium';
+  });
+  const rb=document.createElement('button');
+  rb.className='mini';
+  rb.textContent='Remove';
+  rb.addEventListener('click',async()=>{
+   if(!confirm(`Remove model “${m.id}”? Requests to it will fail closed.`))return;
+   try{const r=await window.azureBridge.models({action:'delete',id:m.id});$('cm-message').textContent=r.message;}
+   catch(err){$('cm-message').textContent=cleanIpcError(err,'azure:models');}
+   await refresh();
+  });
+  td.append(eb,rb);
+  tr.append(td);
+  tbody.append(tr);
+ }
+}
+
+let playModelsSig='';
+function renderPlayModels(models){
+ const sig=(models||[]).map(m=>m.id).join(',');
+ if(sig===playModelsSig)return;
+ playModelsSig=sig;
+ const sel=$('play-model');
+ const current=sel.value;
+ sel.replaceChildren();
+ for(const m of models||[]){
+  const o=document.createElement('option');
+  o.value=m.id;
+  o.textContent=`${m.label||m.id} (${m.id})`;
+  sel.append(o);
+ }
+ if([...sel.options].some(o=>o.value===current))sel.value=current;
+}
+
+$('cm-save').addEventListener('click',async()=>{
+ const button=$('cm-save');
+ button.disabled=true;
+ try{
+  const r=await window.azureBridge.models({action:'save',model:{id:$('cm-id').value,label:$('cm-label').value,deployment:$('cm-deployment').value,protocol:$('cm-protocol').value,contextWindow:Number($('cm-context').value),maxOutputTokens:Number($('cm-maxout').value),defaultEffort:$('cm-effort').value}});
+  $('cm-message').textContent=r.message;
+  $('cm-id').value='';$('cm-label').value='';$('cm-deployment').value='';
+ }catch(err){
+  $('cm-message').textContent=cleanIpcError(err,'azure:models');
+ }finally{
+  button.disabled=false;
+  await refresh();
+ }
+});
 
 function toggleDetail(id){
  expandedId=expandedId===id?null:id;
@@ -483,7 +570,10 @@ async function refresh(){
   $('detail-tunnel').textContent=s.baseUrl?(s.mode==='named'?`Named Cloudflare tunnel “${s.tunnelName||'azure-cursor-bridge'}” — permanent URL`:'Temporary quick tunnel — URL changes on restart'):'—';
   if(!actionPending&&s.running&&s.tunnel?.ok===false)$('message').textContent=`Bridge is running locally. Tunnel failed: ${s.tunnel.error}`;
   pricingCfg=s.pricing;
-  loadPricingForm(s.pricing);
+  lastModels=s.models||[];
+  renderPricingForm(lastModels,s.pricing);
+  renderCustomModels(lastModels);
+  renderPlayModels(lastModels);
   if(s.pricingIsDefault&&!$('price-message').textContent)$('price-message').textContent='Prefilled with Azure list prices (Global Standard, Sep 2026) — verify against your agreement and save.';
   renderAzureKey(s.azureKey);
   maybeShowWizard(s.azureKey);
@@ -523,12 +613,16 @@ setInterval(refresh,2500);
 $('price-save').addEventListener('click',async()=>{
  const button=$('price-save');
  button.disabled=true;
- const num=id=>{const v=$(id).value;return v===''?0:Number(v);};
  try{
-  pricingCfg=await window.azureBridge.savePricing({
-   'azure-astra':{input:num('price-astra-input'),cachedInput:num('price-astra-cached'),output:num('price-astra-output')},
-   'azure-opus':{input:num('price-opus-input'),cachedInput:num('price-opus-cached'),output:num('price-opus-output')}
-  });
+  const payload={};
+  for(const m of lastModels){
+   payload[m.id]={};
+   for(const f of ['input','cachedInput','output']){
+    const el=$(`price-${m.id}-${f}`);
+    payload[m.id][f]=el&&el.value!==''?Number(el.value):0;
+   }
+  }
+  pricingCfg=await window.azureBridge.savePricing(payload);
   $('price-message').textContent='Rates saved — estimates update immediately.';
  }catch(err){
   $('price-message').textContent=cleanIpcError(err,'azure:pricing');

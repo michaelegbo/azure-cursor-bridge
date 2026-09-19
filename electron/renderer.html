@@ -98,6 +98,11 @@
   .wizard-hint{font-size:13px;color:#8d99a5}
   #wiz-message{color:#a6d6f9}
   .mini-bar{height:6px;border-radius:3px;background:#5b8dd9;min-width:2px}
+  .model-form{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
+  .model-form label{margin:0;font-size:12px;color:#a8b5c1}
+  .model-form input,.model-form select{display:block;width:100%;margin-top:4px;padding:7px;background:#222c34;color:#eee;border:1px solid #647582;border-radius:5px;font:inherit}
+  #cm-message{color:#a6d6f9}
+  @media(max-width:880px){.model-form{grid-template-columns:1fr}}
   @keyframes toggle-working{to{transform:translateX(14px)}}
   @media(prefers-reduced-motion:reduce){.status,.bridge-toggle,.toggle-track,.toggle-knob{transition:none}.bridge-toggle.is-busy .toggle-knob{animation:none}}
   @media(max-width:880px){main{padding:24px}.models{grid-template-columns:1fr}header{align-items:flex-start;gap:12px}.app-icon{width:46px;height:46px}}
@@ -148,6 +153,22 @@
    <p id="settings-message" role="status">Changes apply to the next request. Higher effort can take longer and use more tokens.</p>
    <p>These are defaults for bare model names. Clients can override per request — effort-suffixed models in Cursor (e.g. <code>azure-astra-high</code>), the reasoning selector in Codex. See “Control reasoning effort” under Endpoint details.</p>
    <p>Full Azure context is available through the bridge. Cursor controls the history it sends and may compact earlier. No local truncation is applied.</p>
+  </section>
+  <section class="panel">
+   <h2>Custom models</h2>
+   <p>Expose any other deployment on your Azure resource as a bridge model. Pick the protocol that matches the deployment: <b>OpenAI (responses)</b> for GPT-family models, <b>Anthropic (messages)</b> for Claude-family models. New models are live immediately, appear in <code>/v1/models</code> with effort-suffixed variants, and support pricing and usage tracking — add the model id to Cursor's model list to use it there.</p>
+   <table><thead><tr><th>Id</th><th>Label</th><th>Deployment</th><th>Protocol</th><th>Context</th><th>Default effort</th><th>Actions</th></tr></thead><tbody id="custom-models"></tbody></table>
+   <div id="custom-empty" class="empty">No custom models yet — the two built-ins are always available.</div>
+   <div class="model-form">
+    <label>Model id<input id="cm-id" placeholder="azure-haiku" maxlength="40"></label>
+    <label>Label<input id="cm-label" placeholder="Azure · Claude Haiku" maxlength="60"></label>
+    <label>Azure deployment name<input id="cm-deployment" placeholder="claude-haiku-4-5" maxlength="80"></label>
+    <label>Protocol<select id="cm-protocol"><option value="responses">OpenAI (responses)</option><option value="anthropic">Anthropic (messages)</option></select></label>
+    <label>Context window<input id="cm-context" type="number" min="1000" max="10000000" value="1000000"></label>
+    <label>Max output tokens<input id="cm-maxout" type="number" min="256" max="128000" value="128000"></label>
+    <label>Default effort<select id="cm-effort"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label>
+   </div>
+   <div class="actions"><button id="cm-save">Add / update model</button><span id="cm-message" role="status"></span></div>
   </section>
   </div>
   <div class="page" data-page="docs">
@@ -266,18 +287,7 @@
    <h2>Usage &amp; cost</h2>
    <p>Token totals for everything that passes through the bridge, bucketed per day. Enter <b>your</b> Azure rates in US dollars per 1 million tokens (from the Azure portal / your agreement) and the bridge estimates cost — estimates, not invoices. Counting starts from when this feature was added.</p>
    <table><thead><tr><th>Period</th><th>Requests</th><th>Tokens in (cached)</th><th>Tokens out</th><th>Est. cost</th></tr></thead><tbody id="usage-rows"></tbody></table>
-   <div class="pricing-grid">
-    <div class="pricing-row"><span>GPT-6 Astra (azure-astra)</span>
-     <label>Input $/1M<input id="price-astra-input" type="number" min="0" step="0.01"></label>
-     <label>Cached input $/1M<input id="price-astra-cached" type="number" min="0" step="0.01"></label>
-     <label>Output $/1M<input id="price-astra-output" type="number" min="0" step="0.01"></label>
-    </div>
-    <div class="pricing-row"><span>Claude Opus 5 (azure-opus)</span>
-     <label>Input $/1M<input id="price-opus-input" type="number" min="0" step="0.01"></label>
-     <label>Cached input $/1M<input id="price-opus-cached" type="number" min="0" step="0.01"></label>
-     <label>Output $/1M<input id="price-opus-output" type="number" min="0" step="0.01"></label>
-    </div>
-   </div>
+   <div class="pricing-grid" id="pricing-grid"></div>
    <div class="actions"><button id="price-save">Save rates</button><span id="price-message" role="status"></span></div>
   </section>
   <section class="panel">

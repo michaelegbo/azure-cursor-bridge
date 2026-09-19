@@ -19,7 +19,8 @@ function defaultStateDir() {
 }
 const state = defaultStateDir();
 await mkdir(state, { recursive: true });
-const { settings } = await import(pathToFileURL(path.join(bridgeRoot, 'src/model-settings.mjs')).href);
+const { settings, LIMITS, EFFORTS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/model-settings.mjs')).href);
+const { MODELS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/azure-adapter.mjs')).href);
 const { openDb } = await import(pathToFileURL(path.join(bridgeRoot, 'src/db.mjs')).href);
 
 let win;
@@ -100,6 +101,47 @@ function aggregatePeriods() {
   return { today: db.usageAggregate(1), week: db.usageAggregate(7), month: db.usageAggregate(30), all: db.usageAggregate(null) };
 }
 
+const CUSTOM_MODEL_ID = /^[a-z0-9][a-z0-9-]{1,39}$/;
+const EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/;
+function modelRegistry() {
+  const builtins = MODELS.map(m => ({ ...m, ...LIMITS[m.id], builtin: true }));
+  const taken = new Set(builtins.flatMap(m => [m.id, m.deployment]));
+  const custom = (db.settingGet('custom-models') || []).filter(m => m && !taken.has(m.id));
+  return [...builtins, ...custom.map(m => ({ ...m, builtin: false }))];
+}
+ipcMain.handle('azure:models', async (_e, cmd) => {
+  const action = cmd?.action;
+  const custom = db.settingGet('custom-models') || [];
+  if (action === 'delete') {
+    const id = String(cmd.id || '');
+    if (!custom.some(m => m.id === id)) throw Error('Model not found');
+    db.settingSet('custom-models', custom.filter(m => m.id !== id));
+    return { message: `Model “${id}” removed. Requests to it now fail closed.` };
+  }
+  if (action === 'save') {
+    const id = String(cmd.model?.id || '').trim().toLowerCase();
+    if (!CUSTOM_MODEL_ID.test(id)) throw Error('Model id must be 2-40 lowercase letters, digits or dashes');
+    if (EFFORT_SUFFIX.test(id)) throw Error('Model id must not end in an effort suffix (-low, -medium, -high, -xhigh, -max)');
+    const builtinTaken = new Set(MODELS.flatMap(m => [m.id, m.deployment]));
+    if (builtinTaken.has(id)) throw Error('That id is reserved by a built-in model');
+    const deployment = String(cmd.model?.deployment || '').trim();
+    if (!deployment || deployment.length > 80) throw Error('Enter the Azure deployment name');
+    const protocol = cmd.model?.protocol;
+    if (!['responses', 'anthropic'].includes(protocol)) throw Error('Pick the API protocol: responses (OpenAI models) or anthropic (Claude models)');
+    const contextWindow = Number(cmd.model?.contextWindow) || 1000000;
+    if (contextWindow < 1000 || contextWindow > 10000000) throw Error('Context window must be between 1,000 and 10,000,000 tokens');
+    const maxOutputTokens = Number(cmd.model?.maxOutputTokens) || 128000;
+    if (maxOutputTokens < 256 || maxOutputTokens > 128000) throw Error('Max output must be between 256 and 128,000 tokens');
+    const defaultEffort = EFFORTS.includes(cmd.model?.defaultEffort) ? cmd.model.defaultEffort : 'medium';
+    const entry = { id, deployment, label: String(cmd.model?.label || '').trim().slice(0, 60) || id, protocol, contextWindow, maxOutputTokens, defaultEffort };
+    const existing = custom.findIndex(m => m.id === id);
+    if (existing >= 0) custom[existing] = entry; else custom.push(entry);
+    db.settingSet('custom-models', custom);
+    return { message: `Model “${id}” saved — it is live on the next request (add it in Cursor's model list to use it there)` };
+  }
+  throw Error('Unknown models action');
+});
+
 async function azureKeyInfo() {
   const azure = await json('azure.json');
   let manifest = db.settingGet('azure-key-manifest');
@@ -152,6 +194,7 @@ ipcMain.handle('azure:snapshot', async () => {
     mode: tunnel?.mode || '',
     tunnelName: tunnel?.tunnelName || '',
     tunnel: startStatus?.tunnel || null,
+    models: modelRegistry(),
     azureKey: await azureKeyInfo(),
     pricing: db.settingGet('pricing') || DEFAULT_PRICING,
     pricingIsDefault: !db.settingGet('pricing'),
@@ -165,16 +208,18 @@ ipcMain.handle('azure:snapshot', async () => {
 ipcMain.handle('azure:settings', async (_e, value) => { const validated = settings(value); db.settingSet('model-settings', validated); return validated; });
 
 ipcMain.handle('azure:pricing', async (_e, value) => {
+  const known = new Set(modelRegistry().map(m => m.id));
   const clean = {};
-  for (const id of ['azure-astra', 'azure-opus']) {
-    const v = value?.[id] || {};
+  for (const [id, v] of Object.entries(value || {})) {
+    if (!known.has(id)) continue;
     clean[id] = {};
     for (const f of ['input', 'cachedInput', 'output']) {
-      const n = Number(v[f]);
+      const n = Number(v?.[f]);
       if (!Number.isFinite(n) || n < 0 || n > 100000) throw Error('Rates must be numbers between 0 and 100000 (US dollars per 1 million tokens)');
       clean[id][f] = n;
     }
   }
+  if (!Object.keys(clean).length) throw Error('No valid model rates were provided');
   db.settingSet('pricing', clean);
   return clean;
 });
@@ -182,7 +227,8 @@ ipcMain.handle('azure:pricing', async (_e, value) => {
 ipcMain.handle('azure:test', async (_e, payload) => {
   const config = await json('config.json');
   if (!config?.apiKey) throw Error('Bridge is not installed.');
-  const model = payload?.model === 'azure-opus' ? 'azure-opus' : 'azure-astra';
+  const known = new Set(modelRegistry().map(m => m.id));
+  const model = known.has(payload?.model) ? payload.model : 'azure-astra';
   const prompt = String(payload?.prompt || '').trim().slice(0, 4000);
   if (!prompt) throw Error('Enter a prompt to test.');
   let base = `http://127.0.0.1:${config.port || 17834}/v1`;

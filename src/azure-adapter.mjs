@@ -5,17 +5,17 @@ export const MODELS = [
   { id: 'azure-astra', deployment: 'gpt-6-astra', label: 'Azure · GPT-6 Astra', protocol: 'responses' },
   { id: 'azure-opus', deployment: 'claude-opus-5', label: 'Azure · Claude Opus 5', protocol: 'anthropic' },
 ];
-export function routeModel(id) {
+export function routeModel(id, models = MODELS) {
   const s = String(id || '');
   // Effort-suffixed aliases (azure-astra-high, azure-opus-max, ...) let clients
   // without a reasoning selector, like Cursor, pick the effort by model name.
   const match = /^(.*)-(low|medium|high|xhigh|max)$/.exec(s);
   if (match) {
-    const base = MODELS.find(m => m.id === match[1] || m.deployment === match[1]);
+    const base = models.find(m => m.id === match[1] || m.deployment === match[1]);
     if (base) return { ...base, effort: match[2] };
   }
-  const route = MODELS.find(m => m.id === s || m.deployment === s);
-  if (!route) throw new BridgeError(`Unknown model: ${s.slice(0,80)}. Choose azure-astra or azure-opus, optionally with an effort suffix such as azure-astra-high.`, 400);
+  const route = models.find(m => m.id === s || m.deployment === s);
+  if (!route) throw new BridgeError(`Unknown model: ${s.slice(0,80)}. Choose one of ${models.map(m => m.id).join(', ')}, optionally with an effort suffix such as -high.`, 400);
   return route;
 }
 const text = v => typeof v === 'string' ? v : JSON.stringify(v ?? '');
