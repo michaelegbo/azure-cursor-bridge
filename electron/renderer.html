@@ -161,7 +161,7 @@
   </section>
   <section class="panel">
    <h2>Claude account</h2>
-   <p>Models on the <b>Claude CLI</b> protocol run locally through the Claude Code CLI using your Claude subscription — no Azure involved. They are plain-text chat models: client tool calling is not forwarded, so use them for Ask/chat rather than agent mode.</p>
+   <p>Models on the <b>Claude CLI</b> protocol run locally through the Claude Code CLI using your Claude subscription — no Azure involved. Client tool calling (Cursor agent mode, Codex) is supported through structured tool-call emulation; Claude Code's own local tools stay fully disabled.</p>
    <div class="kv"><span>Claude CLI</span><code id="claude-cli-status">—</code></div>
    <div class="actions"><button id="claude-login">Log in with Claude</button><span id="claude-message" role="status"></span></div>
   </section>
@@ -199,7 +199,8 @@
      <li><code>bridge-claude-haiku</code> — Claude Haiku 4.5 (fastest)</li>
     </ol>
     <p><b>Effort</b> works like every bridge model — suffix the name (<code>bridge-claude-fable-max</code>, <code>bridge-claude-haiku-low</code>), send a client reasoning setting, or rely on the model card default. For Claude models, effort maps to a thinking-token budget: low = thinking off, medium = 4,096, high = 16,384, xhigh = 32,768, max = 63,999 thinking tokens.</p>
-    <p><b>Requirements &amp; limits:</b> the Claude CLI must be installed and logged in on the bridge machine (Overview → Claude account → “Log in with Claude”). Responses are plain text — client-side tool definitions are not forwarded, so agent modes that need tool calls should use the Azure models. Usage draws on your Claude subscription limits, including requests made with guest keys.</p>
+    <p><b>Tool calling:</b> client tools (Cursor agent mode, Codex) work via emulation — the bridge passes the client's tool schemas to Claude in the system prompt with a strict call format, converts Claude's calls into standard OpenAI <code>tool_calls</code>, and feeds results back on the next request. One tool call per reply; Claude Code's own local tools are always disabled for bridge requests.</p>
+    <p><b>Requirements &amp; limits:</b> the Claude CLI must be installed and logged in on the bridge machine (Overview → Claude account → “Log in with Claude”). Usage draws on your Claude subscription limits, including requests made with guest keys.</p>
    </details>
    <details>
     <summary>Control reasoning effort</summary>
