@@ -95,6 +95,42 @@ function renderUsageDays(days){
 }
 
 let lastModels=[];
+let modelCardsSig='';
+function renderModelCards(models,modelSettings){
+ const sig=(models||[]).map(m=>m.id).join(',');
+ if(sig===modelCardsSig)return;
+ modelCardsSig=sig;
+ const grid=$('model-cards');
+ grid.replaceChildren();
+ for(const m of models||[]){
+  const card=document.createElement('article');
+  card.className='panel';
+  const name=document.createElement('div');
+  name.className='modelname';
+  name.textContent=(m.label||m.id).replace(/^Azure · /,'');
+  const idCode=document.createElement('code');
+  idCode.textContent=m.id;
+  const dep=document.createElement('p');
+  dep.textContent=`Azure deployment: ${m.deployment}`+(m.builtin?'':' · custom'+(m.protocol==='chat'?' · chat completions':''));
+  const label=document.createElement('label');
+  label.textContent='Reasoning mode';
+  label.htmlFor=`effort-${m.id}`;
+  const sel=document.createElement('select');
+  sel.id=`effort-${m.id}`;
+  for(const [v,t] of [['low','Low'],['medium','Medium'],['high','High'],['xhigh','Extra High'],['max','Max']]){
+   const o=document.createElement('option');
+   o.value=v;o.textContent=t;
+   sel.append(o);
+  }
+  sel.value=m.builtin?(modelSettings?.[m.id]?.effort||'medium'):(m.defaultEffort||'medium');
+  const ctx=document.createElement('p');
+  ctx.textContent=`Maximum context: ${(m.contextWindow||0).toLocaleString()} tokens`+(m.maxInputTokens?` (up to ${m.maxInputTokens.toLocaleString()} input)`:'');
+  const out=document.createElement('p');
+  out.textContent=`Output allowance: up to ${(m.maxOutputTokens||128000).toLocaleString()} tokens`;
+  card.append(name,idCode,dep,label,sel,ctx,out);
+  grid.append(card);
+ }
+}
 let pricingModelsSig='';
 function renderPricingForm(models,pricing){
  const sig=(models||[]).map(m=>m.id).join(',');
@@ -555,10 +591,7 @@ async function refresh(){
  try{
   const s=await window.azureBridge.snapshot();
   bridgeRunning=s.running;
-  if(!settingsLoaded){
-   for(const model of ['astra','opus'])$(model+'-effort').value=s.settings['azure-'+model].effort;
-   settingsLoaded=true;
-  }
+  renderModelCards(s.models,s.settings);
   if(s.busy)$('status').textContent=s.busy==='restart'?'Restarting bridge…':s.busy==='stop'?'Stopping bridge…':'Starting bridge…';
   else $('status').textContent=s.running?'Bridge running':'Bridge stopped';
   $('status').className='status'+(s.running?' on':'');
@@ -677,11 +710,22 @@ $('save-settings').addEventListener('click',async()=>{
  const button=$('save-settings');
  button.disabled=true;
  try{
-  await window.azureBridge.saveSettings({'azure-astra':{effort:$('astra-effort').value},'azure-opus':{effort:$('opus-effort').value}});
+  const builtins={};
+  for(const m of lastModels){
+   const sel=$(`effort-${m.id}`);
+   if(!sel)continue;
+   if(m.builtin){
+    builtins[m.id]={effort:sel.value};
+   }else if(sel.value!==(m.defaultEffort||'medium')){
+    await window.azureBridge.models({action:'save',model:{id:m.id,label:m.label,deployment:m.deployment,protocol:m.protocol,contextWindow:m.contextWindow,maxOutputTokens:m.maxOutputTokens,defaultEffort:sel.value}});
+   }
+  }
+  if(Object.keys(builtins).length)await window.azureBridge.saveSettings(builtins);
   $('settings-message').textContent='Saved. These modes apply to the next request for each model.';
  }catch(error){
-  $('settings-message').textContent=error.message;
+  $('settings-message').textContent=cleanIpcError(error,'azure:models');
  }finally{
   button.disabled=false;
+  await refresh();
  }
 });

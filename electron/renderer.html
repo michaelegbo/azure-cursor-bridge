@@ -136,18 +136,7 @@
    <div id="message" role="status"></div>
    <p>This is a permanent URL — it stays the same across restarts and reboots. Use it as the OpenAI base URL override in Cursor and the provider base URL in Codex. Keep this computer on while using the bridge.</p>
   </section>
-  <section class="models">
-   <article class="panel">
-    <div class="modelname">GPT-6 Astra</div><code>azure-astra</code><p>Azure deployment: gpt-6-astra</p>
-    <label for="astra-effort">Reasoning mode</label><select id="astra-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select>
-    <p>Maximum context: 1,050,000 tokens (up to 922,000 input)</p><p>Output allowance: up to 128,000 tokens</p>
-   </article>
-   <article class="panel">
-    <div class="modelname">Claude Opus 5</div><code>azure-opus</code><p>Azure deployment: claude-opus-5</p>
-    <label for="opus-effort">Reasoning mode</label><select id="opus-effort"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select>
-    <p>Maximum context: 1,000,000 tokens</p><p>Output allowance: up to 128,000 tokens</p>
-   </article>
-  </section>
+  <section class="models" id="model-cards"></section>
   <section class="panel">
    <button id="save-settings">Save model settings</button>
    <p id="settings-message" role="status">Changes apply to the next request. Higher effort can take longer and use more tokens.</p>
