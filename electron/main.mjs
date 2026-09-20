@@ -384,9 +384,22 @@ ipcMain.handle('azure:azure-key', async (_e, cmd) => {
 });
 
 const claudeCliPath = path.join(os.homedir(), '.local', 'bin', process.platform === 'win32' ? 'claude.exe' : 'claude');
-const claudeCredsPath = path.join(os.homedir(), '.claude', '.credentials.json');
+// `claude auth status` is authoritative (the CLI keeps its login in the OS
+// credential store, not in a readable file). Cached and refreshed off-thread.
+const claudeAuthCache = { at: 0, loggedIn: false, checking: false };
 function claudeCliStatus() {
-  return { installed: existsSync(claudeCliPath), loggedIn: existsSync(claudeCredsPath) };
+  const installed = existsSync(claudeCliPath);
+  if (installed && Date.now() - claudeAuthCache.at > 30000 && !claudeAuthCache.checking) {
+    claudeAuthCache.checking = true;
+    import('node:child_process').then(({ execFile }) => {
+      execFile(claudeCliPath, ['auth', 'status'], { windowsHide: true, timeout: 15000 }, (_err, stdout) => {
+        try { claudeAuthCache.loggedIn = Boolean(JSON.parse(String(stdout)).loggedIn); } catch {}
+        claudeAuthCache.at = Date.now();
+        claudeAuthCache.checking = false;
+      });
+    }).catch(() => { claudeAuthCache.checking = false; });
+  }
+  return { installed, loggedIn: claudeAuthCache.loggedIn };
 }
 ipcMain.handle('azure:claude-login', async () => {
   if (!existsSync(claudeCliPath)) throw Error('The Claude CLI is not installed. Install it from https://claude.ai/install.ps1 first.');
