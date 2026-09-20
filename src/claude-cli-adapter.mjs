@@ -38,7 +38,10 @@ export async function runClaudeCli({ body, protocol, route, effort, sink, signal
   const systemFile = path.join(workDir, `system-${randomUUID()}.txt`);
   writeFileSync(systemFile, system);
 
-  const args = ['-p', '--model', route.deployment, '--output-format', 'stream-json', '--include-partial-messages', '--verbose', '--max-turns', '1', '--strict-mcp-config', '--system-prompt-file', systemFile];
+  // --tools "" removes every built-in tool so the model cannot emit tool_use
+  // (which would burn the single allowed turn and truncate the reply), and
+  // callers can never drive Claude Code tools on the bridge machine.
+  const args = ['-p', '--model', route.deployment, '--output-format', 'stream-json', '--include-partial-messages', '--verbose', '--max-turns', '1', '--strict-mcp-config', '--restricted', '--tools', '', '--system-prompt-file', systemFile];
   const child = spawn(claudeCliPath(), args, {
     cwd: workDir,
     env: { ...process.env, MAX_THINKING_TOKENS: String(CLI_EFFORT_THINKING[effort] ?? 16384), CLAUDE_CODE_DISABLE_AUTOUPDATE: '1' },
@@ -94,6 +97,9 @@ export async function runClaudeCli({ body, protocol, route, effort, sink, signal
       child.on('exit', code => {
         clearTimeout(timeout);
         if (buffer) handleLine(buffer);
+        // If usable text was already streamed and the failure is only the
+        // turn limit, deliver the text instead of erroring mid-stream.
+        if (errorMessage && (sawDelta || finalText) && /max.?turns|Claude CLI request failed/i.test(errorMessage)) errorMessage = null;
         if (errorMessage) {
           const notLoggedIn = /not logged in|authentication/i.test(errorMessage);
           reject(new BridgeError(notLoggedIn ? 'The Claude CLI is not logged in. Open the bridge app and use “Log in with Claude”.' : errorMessage, notLoggedIn ? 503 : 502));
