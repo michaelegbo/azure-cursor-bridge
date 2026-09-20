@@ -191,14 +191,14 @@
    </details>
    <details>
     <summary>Claude CLI models — names &amp; effort</summary>
-    <p>These models run through the local Claude Code CLI on your Claude subscription. Use them from any client exactly like the Azure models — same base URL, same bridge key. Model names:</p>
+    <p>These models run through the local Claude Code CLI on your Claude subscription. Use them from any client exactly like the Azure models — same base URL, same bridge key. The <code>bridge-</code> prefix avoids clashing with clients' own built-in Claude model names (Cursor intercepts bare <code>claude-*</code> names). Model names:</p>
     <ol>
-     <li><code>claude-fable</code> — Claude Fable 5.1 (most capable)</li>
-     <li><code>claude-opus</code> — Claude Opus 5 (also available Azure-billed as <code>azure-opus</code>)</li>
-     <li><code>claude-sonnet</code> — Claude Sonnet 5</li>
-     <li><code>claude-haiku</code> — Claude Haiku 4.5 (fastest)</li>
+     <li><code>bridge-claude-fable</code> — Claude Fable 5.1 (most capable)</li>
+     <li><code>bridge-claude-opus</code> — Claude Opus 5 (also available Azure-billed as <code>azure-opus</code>)</li>
+     <li><code>bridge-claude-sonnet</code> — Claude Sonnet 5</li>
+     <li><code>bridge-claude-haiku</code> — Claude Haiku 4.5 (fastest)</li>
     </ol>
-    <p><b>Effort</b> works like every bridge model — suffix the name (<code>claude-fable-max</code>, <code>claude-haiku-low</code>), send a client reasoning setting, or rely on the model card default. For Claude models, effort maps to a thinking-token budget: low = thinking off, medium = 4,096, high = 16,384, xhigh = 32,768, max = 63,999 thinking tokens.</p>
+    <p><b>Effort</b> works like every bridge model — suffix the name (<code>bridge-claude-fable-max</code>, <code>bridge-claude-haiku-low</code>), send a client reasoning setting, or rely on the model card default. For Claude models, effort maps to a thinking-token budget: low = thinking off, medium = 4,096, high = 16,384, xhigh = 32,768, max = 63,999 thinking tokens.</p>
     <p><b>Requirements &amp; limits:</b> the Claude CLI must be installed and logged in on the bridge machine (Overview → Claude account → “Log in with Claude”). Responses are plain text — client-side tool definitions are not forwarded, so agent modes that need tool calls should use the Azure models. Usage draws on your Claude subscription limits, including requests made with guest keys.</p>
    </details>
    <details>
