@@ -127,7 +127,7 @@ ipcMain.handle('azure:models', async (_e, cmd) => {
     const deployment = String(cmd.model?.deployment || '').trim();
     if (!deployment || deployment.length > 80) throw Error('Enter the Azure deployment name');
     const protocol = cmd.model?.protocol;
-    if (!['responses', 'anthropic', 'chat'].includes(protocol)) throw Error('Pick the API protocol: responses (OpenAI models), anthropic (Claude models), or chat (chat-completions-only deployments like model-router)');
+    if (!['responses', 'anthropic', 'chat', 'claude-cli'].includes(protocol)) throw Error('Pick the API protocol: responses (OpenAI models), anthropic (Claude on Azure), chat (chat-completions-only deployments like model-router), or claude-cli (your Claude subscription via the Claude CLI)');
     const contextWindow = Number(cmd.model?.contextWindow) || 1000000;
     if (contextWindow < 1000 || contextWindow > 10000000) throw Error('Context window must be between 1,000 and 10,000,000 tokens');
     const maxOutputTokens = Number(cmd.model?.maxOutputTokens) || 128000;
@@ -195,6 +195,7 @@ ipcMain.handle('azure:snapshot', async () => {
     tunnelName: tunnel?.tunnelName || '',
     tunnel: startStatus?.tunnel || null,
     models: modelRegistry(),
+    claudeCli: claudeCliStatus(),
     azureKey: await azureKeyInfo(),
     pricing: db.settingGet('pricing') || DEFAULT_PRICING,
     pricingIsDefault: !db.settingGet('pricing'),
@@ -382,6 +383,23 @@ ipcMain.handle('azure:azure-key', async (_e, cmd) => {
   throw Error('Unknown Azure key action');
 });
 
+const claudeCliPath = path.join(os.homedir(), '.local', 'bin', process.platform === 'win32' ? 'claude.exe' : 'claude');
+const claudeCredsPath = path.join(os.homedir(), '.claude', '.credentials.json');
+function claudeCliStatus() {
+  return { installed: existsSync(claudeCliPath), loggedIn: existsSync(claudeCredsPath) };
+}
+ipcMain.handle('azure:claude-login', async () => {
+  if (!existsSync(claudeCliPath)) throw Error('The Claude CLI is not installed. Install it from https://claude.ai/install.ps1 first.');
+  const { spawn } = await import('node:child_process');
+  if (process.platform === 'win32') {
+    spawn('cmd.exe', ['/c', 'start', 'Log in with Claude', 'cmd', '/k', claudeCliPath, '/login'], { detached: true, windowsHide: false }).unref();
+  } else if (process.platform === 'darwin') {
+    spawn('osascript', ['-e', `tell application "Terminal" to do script "${claudeCliPath} /login"`], { detached: true }).unref();
+  } else {
+    spawn('x-terminal-emulator', ['-e', `${claudeCliPath} /login`], { detached: true }).unref();
+  }
+  return { message: 'A terminal opened with the Claude login — finish signing in there (it opens your browser), then Claude CLI models work immediately.' };
+});
 ipcMain.handle('azure:action', async (_e, action) => {
   if (action === 'copy-key') { clipboard.writeText((await json('config.json')).apiKey); return 'Bridge key copied'; }
   if (action === 'copy-url') { clipboard.writeText((await json('tunnel.json')).baseUrl); return 'URL copied'; }

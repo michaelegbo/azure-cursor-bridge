@@ -111,7 +111,7 @@ function renderModelCards(models,modelSettings){
   const idCode=document.createElement('code');
   idCode.textContent=m.id;
   const dep=document.createElement('p');
-  dep.textContent=`Azure deployment: ${m.deployment}`+(m.builtin?'':' · custom'+(m.protocol==='chat'?' · chat completions':''));
+  dep.textContent=(m.protocol==='claude-cli'?`Claude CLI model: ${m.deployment} · your Claude subscription`:`Azure deployment: ${m.deployment}`)+(m.builtin?'':' · custom'+(m.protocol==='chat'?' · chat completions':''));
   const label=document.createElement('label');
   label.textContent='Reasoning mode';
   label.htmlFor=`effort-${m.id}`;
@@ -166,7 +166,7 @@ function renderCustomModels(models){
  tbody.replaceChildren();
  for(const m of custom){
   const tr=document.createElement('tr');
-  for(const value of [m.id,m.label||m.id,m.deployment,{responses:'OpenAI',anthropic:'Anthropic',chat:'Chat completions'}[m.protocol]||m.protocol,(m.contextWindow||0).toLocaleString(),m.defaultEffort||'medium']){
+  for(const value of [m.id,m.label||m.id,m.deployment,{responses:'OpenAI',anthropic:'Anthropic',chat:'Chat completions','claude-cli':'Claude CLI'}[m.protocol]||m.protocol,(m.contextWindow||0).toLocaleString(),m.defaultEffort||'medium']){
    const td=document.createElement('td');
    td.textContent=value;
    tr.append(td);
@@ -211,6 +211,14 @@ function renderPlayModels(models){
  }
  if([...sel.options].some(o=>o.value===current))sel.value=current;
 }
+
+$('claude-login').addEventListener('click',async()=>{
+ const button=$('claude-login');
+ button.disabled=true;
+ try{const r=await window.azureBridge.claudeLogin();$('claude-message').textContent=r.message;}
+ catch(err){$('claude-message').textContent=cleanIpcError(err,'azure:claude-login');}
+ finally{button.disabled=false;}
+});
 
 $('cm-save').addEventListener('click',async()=>{
  const button=$('cm-save');
@@ -592,6 +600,7 @@ async function refresh(){
   const s=await window.azureBridge.snapshot();
   bridgeRunning=s.running;
   renderModelCards(s.models,s.settings);
+  if(s.claudeCli)$('claude-cli-status').textContent=s.claudeCli.installed?(s.claudeCli.loggedIn?'Installed · logged in':'Installed · NOT logged in — Claude CLI models will fail until you log in'):'Not installed';
   if(s.busy)$('status').textContent=s.busy==='restart'?'Restarting bridge…':s.busy==='stop'?'Stopping bridge…':'Starting bridge…';
   else $('status').textContent=s.running?'Bridge running':'Bridge stopped';
   $('status').className='status'+(s.running?' on':'');

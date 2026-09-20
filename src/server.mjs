@@ -6,6 +6,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { createSink, sendJson, sendOpenAIError } from './openai-protocol.mjs';
 import { BridgeError } from './errors.mjs';
 import { MODELS, routeModel, runAzure } from './azure-adapter.mjs';
+import { runClaudeCli } from './claude-cli-adapter.mjs';
 import { settings, LIMITS, EFFORTS, resolveEffort } from './model-settings.mjs';
 import { openDb } from './db.mjs';
 
@@ -41,7 +42,7 @@ function registry() {
   let custom = [];
   try { custom = db.settingGet('custom-models') || []; } catch {}
   const extras = (Array.isArray(custom) ? custom : [])
-    .filter(m => m && CUSTOM_ID.test(m.id || '') && m.deployment && ['responses', 'anthropic', 'chat'].includes(m.protocol) && !taken.has(m.id))
+    .filter(m => m && CUSTOM_ID.test(m.id || '') && m.deployment && ['responses', 'anthropic', 'chat', 'claude-cli'].includes(m.protocol) && !taken.has(m.id))
     .map(m => ({ id: m.id, deployment: String(m.deployment), label: m.label || m.id, protocol: m.protocol, defaultEffort: m.defaultEffort, contextWindow: Number(m.contextWindow) || 1000000, maxInputTokens: m.maxInputTokens ? Number(m.maxInputTokens) : undefined, maxOutputTokens: Number(m.maxOutputTokens) || 128000 }));
   return [...builtins, ...extras];
 }
@@ -128,11 +129,14 @@ const server = http.createServer(async (req, res) => {
     if (!who) throw new BridgeError('Invalid bridge API key', 401);
     if (req.method === 'GET' && ['/v1/models', '/models'].includes(url.pathname)) return sendJson(res, 200, { object: 'list', data: registry().flatMap(m => [{ id: m.id, name: m.label }, ...EFFORTS.map(e => ({ id: `${m.id}-${e}`, name: `${m.label} · ${e}` }))].map(v => ({ id: v.id, object: 'model', created: 1789170000, owned_by: 'azure', name: v.name, context_window: m.contextWindow, max_input_tokens: m.maxInputTokens ?? m.contextWindow, max_output_tokens: m.maxOutputTokens || 128000, reasoning_efforts: EFFORTS }))) });
     if (req.method !== 'POST' || !['/v1/chat/completions', '/chat/completions', '/v1/responses', '/responses'].includes(url.pathname)) throw new BridgeError('Not found', 404);
-    if (!key) throw new BridgeError('No Azure API key is configured. Set it in the bridge app.', 503);
-    const endpoint = await azureEndpoint();
     let bytes = 0; const chunks = []; for await (const chunk of req) { bytes += chunk.length; if (bytes > 32 * 1024 * 1024) throw new BridgeError('Request too large', 413); chunks.push(chunk); }
     let body; try { body = JSON.parse(Buffer.concat(chunks)); } catch { throw new BridgeError('Invalid JSON', 400); }
     const route = routeModel(body.model, registry()), protocol = url.pathname.endsWith('/responses') ? 'responses' : 'chat';
+    let endpoint = null;
+    if (route.protocol !== 'claude-cli') {
+      if (!key) throw new BridgeError('No Azure API key is configured. Set it in the bridge app.', 503);
+      endpoint = await azureEndpoint();
+    }
     if (body.previous_response_id) throw new BridgeError('Send the full conversation history; previous_response_id is not supported by this stateless bridge.', 400);
     if (protocol === 'chat' && !Array.isArray(body.messages)) throw new BridgeError('messages must be an array', 400);
     let preferences; try { preferences = settings(db.settingGet('model-settings') || {}); } catch { preferences = settings(); }
@@ -149,7 +153,10 @@ const server = http.createServer(async (req, res) => {
       try { db.upsertRequest(entry); } catch {}
     } });
     const heartbeat = setInterval(() => { if (res.headersSent && !res.writableEnded) res.write(': keepalive\n\n'); }, 15000);
-    try { await runAzure({ body, protocol, route, key, endpoint, signal: abort.signal, sink, preferences }); } finally { clearInterval(heartbeat); }
+    try {
+      if (route.protocol === 'claude-cli') await runClaudeCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir });
+      else await runAzure({ body, protocol, route, key, endpoint, signal: abort.signal, sink, preferences });
+    } finally { clearInterval(heartbeat); }
   } catch (error) {
     if (entry) { entry.status = 'failed'; entry.error = String(error.message).replaceAll(key || ' ', '[redacted]').slice(0, 500); try { db.upsertRequest(entry); } catch {} }
     if (sink) sink.error(error); else sendOpenAIError(res, error);

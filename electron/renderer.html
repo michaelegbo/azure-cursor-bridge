@@ -152,12 +152,18 @@
     <label>Model id<input id="cm-id" placeholder="azure-haiku" maxlength="40"></label>
     <label>Label<input id="cm-label" placeholder="Azure · Claude Haiku" maxlength="60"></label>
     <label>Azure deployment name<input id="cm-deployment" placeholder="claude-haiku-4-5" maxlength="80"></label>
-    <label>Protocol<select id="cm-protocol"><option value="responses">OpenAI (responses)</option><option value="anthropic">Anthropic (messages)</option><option value="chat">OpenAI chat completions (model-router etc.)</option></select></label>
+    <label>Protocol<select id="cm-protocol"><option value="responses">OpenAI (responses)</option><option value="anthropic">Anthropic (messages)</option><option value="chat">OpenAI chat completions (model-router etc.)</option><option value="claude-cli">Claude CLI (your Claude subscription)</option></select></label>
     <label>Context window<input id="cm-context" type="number" min="1000" max="10000000" value="1000000"></label>
     <label>Max output tokens<input id="cm-maxout" type="number" min="256" max="128000" value="128000"></label>
     <label>Default effort<select id="cm-effort"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label>
    </div>
    <div class="actions"><button id="cm-save">Add / update model</button><span id="cm-message" role="status"></span></div>
+  </section>
+  <section class="panel">
+   <h2>Claude account</h2>
+   <p>Models on the <b>Claude CLI</b> protocol run locally through the Claude Code CLI using your Claude subscription — no Azure involved. They are plain-text chat models: client tool calling is not forwarded, so use them for Ask/chat rather than agent mode.</p>
+   <div class="kv"><span>Claude CLI</span><code id="claude-cli-status">—</code></div>
+   <div class="actions"><button id="claude-login">Log in with Claude</button><span id="claude-message" role="status"></span></div>
   </section>
   </div>
   <div class="page" data-page="docs">
@@ -182,6 +188,18 @@
     <p>In <code>~/.codex/config.toml</code>, point the provider at the bridge and select a bridge model:</p>
     <pre id="doc-codex"></pre>
     <p>Set the <code>AZURE_CURSOR_BRIDGE_API_KEY</code> environment variable to the bridge key.</p>
+   </details>
+   <details>
+    <summary>Claude CLI models — names &amp; effort</summary>
+    <p>These models run through the local Claude Code CLI on your Claude subscription. Use them from any client exactly like the Azure models — same base URL, same bridge key. Model names:</p>
+    <ol>
+     <li><code>claude-fable</code> — Claude Fable 5.1 (most capable)</li>
+     <li><code>claude-opus</code> — Claude Opus 5 (also available Azure-billed as <code>azure-opus</code>)</li>
+     <li><code>claude-sonnet</code> — Claude Sonnet 5</li>
+     <li><code>claude-haiku</code> — Claude Haiku 4.5 (fastest)</li>
+    </ol>
+    <p><b>Effort</b> works like every bridge model — suffix the name (<code>claude-fable-max</code>, <code>claude-haiku-low</code>), send a client reasoning setting, or rely on the model card default. For Claude models, effort maps to a thinking-token budget: low = thinking off, medium = 4,096, high = 16,384, xhigh = 32,768, max = 63,999 thinking tokens.</p>
+    <p><b>Requirements &amp; limits:</b> the Claude CLI must be installed and logged in on the bridge machine (Overview → Claude account → “Log in with Claude”). Responses are plain text — client-side tool definitions are not forwarded, so agent modes that need tool calls should use the Azure models. Usage draws on your Claude subscription limits, including requests made with guest keys.</p>
    </details>
    <details>
     <summary>Control reasoning effort</summary>
