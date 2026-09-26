@@ -113,7 +113,7 @@ export async function* sseEvents(stream) {
     }
   }
 }
-export async function runAzure({body,protocol,route,key,endpoint,signal,sink,preferences={}}) {
+export async function runAzure({body,protocol,route,key,endpoint,signal,sink,preferences={},onThrottle}) {
   let payload;
   const effort=resolveEffort(body,route,preferences);
   if(route.protocol==='chat'){
@@ -143,16 +143,19 @@ export async function runAzure({body,protocol,route,key,endpoint,signal,sink,pre
   const url=endpoint+(route.protocol==='responses'?'/openai/responses?api-version=2025-04-01-preview':route.protocol==='chat'?`/openai/deployments/${encodeURIComponent(route.deployment)}/chat/completions?api-version=2025-01-01-preview`:'/anthropic/v1/messages');
   // Azure throttles concurrent requests on a shared deployment quota (429).
   // Nothing has been streamed to the client yet, so waiting and retrying is
-  // safe and turns a dead agent turn into a short pause.
+  // safe and turns a dead agent turn into a short pause. A 429 also pauses the
+  // deployment's TPM queue (onThrottle) so queued requests don't pile on.
   let upstream;
   for(let attempt=0;;attempt++){
     upstream=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...(route.protocol==='anthropic'?{'x-api-key':key,'anthropic-version':'2023-06-01'}:{'api-key':key})},body:JSON.stringify(payload),signal});
     if(upstream.ok)break;
-    const retryable=upstream.status===429||upstream.status>=500;
-    if(!retryable||attempt>=3){let e=await upstream.json().catch(()=>({}));throw new BridgeError(e.error?.message||`Azure HTTP ${upstream.status}`,upstream.status);}
+    const throttled=upstream.status===429;
+    const retryable=throttled||upstream.status>=500;
+    if(!retryable||attempt>=(throttled?8:3)){let e=await upstream.json().catch(()=>({}));throw new BridgeError(e.error?.message||`Azure HTTP ${upstream.status}`,upstream.status);}
     await upstream.body?.cancel().catch(()=>{});
     const retryAfter=Number(upstream.headers.get('retry-after'));
-    const wait=Math.min(15000,(Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:1000*2**attempt)+Math.floor(Math.random()*250));
+    const wait=Math.min(throttled?30000:15000,(Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:1000*2**attempt)+Math.floor(Math.random()*250));
+    if(throttled)onThrottle?.(wait);
     await new Promise(resolve=>setTimeout(resolve,wait));
     if(signal?.aborted)throw new BridgeError('Request cancelled by the client',499);
   }

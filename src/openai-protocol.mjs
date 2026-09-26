@@ -415,7 +415,10 @@ class ResponsesSink {
   }
 }
 
-function openSse(response) {
+// Idempotent: the server may open the stream early to keep a queued request's
+// connection alive before the sink opens it.
+export function openSse(response) {
+  if (response.headersSent) return;
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",

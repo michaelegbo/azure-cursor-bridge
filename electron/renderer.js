@@ -59,6 +59,106 @@ function renderUsage(totals){
  }
 }
 
+function fmtWait(ms){
+ if(!ms)return '0s';
+ if(ms<1000)return `${Math.round(ms)}ms`;
+ const s=ms/1000;
+ return s<60?`${s.toFixed(s<10?1:0)}s`:`${Math.floor(s/60)}m ${Math.round(s%60)}s`;
+}
+const fmtTok=n=>Math.round(n||0).toLocaleString();
+
+function renderQueue(live,models){
+ const box=$('queue-live');
+ box.replaceChildren();
+ const budgeted=(models||[]).filter(m=>m.tokensPerMinute>0);
+ const byDeployment=new Map((live?.deployments||[]).map(d=>[d.deployment,d]));
+ if(!live){
+  const p=document.createElement('p');
+  p.className='queue-meta';
+  p.textContent='Live queue unavailable — the bridge is not running.';
+  box.append(p);
+ }
+ for(const m of budgeted){
+  const d=byDeployment.get(m.deployment);
+  const limit=m.tokensPerMinute;
+  // Before its first request a model's budget is full.
+  const raw=d?d.available:limit;
+  const available=Math.max(0,Math.min(limit,raw));
+  const pct=100*available/limit;
+  const card=document.createElement('div');
+  card.className='queue-model';
+  const head=document.createElement('div');
+  head.className='queue-head';
+  const name=document.createElement('b');
+  name.textContent=`${(m.label||m.id).replace(/^Azure · /,'')} (${m.id})`;
+  const badges=document.createElement('span');
+  const waiting=d?.waiting||[];
+  if(d?.pausedForMs>0){const b=document.createElement('span');b.className='badge hot';b.textContent=`Azure throttled · paused ${fmtWait(d.pausedForMs)}`;badges.append(b);}
+  if(waiting.length){const b=document.createElement('span');b.className='badge warn';b.textContent=`${waiting.length} waiting`;badges.append(b);}
+  if(!waiting.length&&!(d?.pausedForMs>0)){const b=document.createElement('span');b.className='badge';b.textContent='flowing';badges.append(b);}
+  head.append(name,badges);
+  const track=document.createElement('div');
+  track.className='budget-track';
+  const fill=document.createElement('div');
+  fill.className='budget-fill'+(pct<5?' empty':pct<25?' low':'');
+  fill.style.width=`${pct.toFixed(1)}%`;
+  track.append(fill);
+  const meta=document.createElement('div');
+  meta.className='queue-meta';
+  meta.textContent=`${fmtTok(available)} of ${fmtTok(limit)} tokens available this minute · refills ${fmtTok(limit/60)} per second`+(raw<0?` · ${fmtTok(-raw)} over budget after a large request, refilling`:'');
+  card.append(head,track,meta);
+  if(waiting.length){
+   const table=document.createElement('table');
+   table.className='queue-waiting';
+   const thead=document.createElement('thead');
+   thead.innerHTML='<tr><th>Waiting request</th><th>Needs</th><th>Waited</th><th></th></tr>';
+   const tbody=document.createElement('tbody');
+   for(const w of waiting){
+    const tr=document.createElement('tr');
+    const tags=[w.priority?'next up (priority)':'',w.oversized?'larger than the whole budget — goes alone when full':''].filter(Boolean).join(' · ');
+    for(const value of [`${w.client||'client'} · ${w.model||m.id}`,`${fmtTok(w.tokens)} tokens`,fmtWait(w.waitedMs),tags]){
+     const td=document.createElement('td');
+     td.textContent=value;
+     tr.append(td);
+    }
+    tbody.append(tr);
+   }
+   table.append(thead,tbody);
+   card.append(table);
+  }
+  box.append(card);
+ }
+ const free=(models||[]).filter(m=>!(m.tokensPerMinute>0)).map(m=>m.id);
+ if(free.length){
+  const p=document.createElement('p');
+  p.className='queue-meta';
+  p.textContent=`No budget — requests flow freely without queuing: ${free.join(', ')}. Set a TPM on a model's card to queue it.`;
+  box.append(p);
+ }
+}
+
+function renderQueueStats(stats){
+ const tbody=$('queue-stats');
+ tbody.replaceChildren();
+ let rows=0;
+ for(const [key,label] of [['today','Today'],['week','Last 7 days']]){
+  for(const [model,q] of Object.entries(stats?.[key]||{})){
+   if(!q.admitted&&!q.throttled)continue;
+   rows++;
+   const tr=document.createElement('tr');
+   const pctWaited=q.admitted?Math.round(100*q.queued/q.admitted):0;
+   const avg=q.queued?q.waitMs/q.queued:0;
+   for(const value of [model,label,String(q.admitted),`${q.queued} (${pctWaited}%)`,q.queued?`${fmtWait(avg)} / ${fmtWait(q.maxWaitMs)}`:'—',String(q.jumped),String(q.throttled)]){
+    const td=document.createElement('td');
+    td.textContent=value;
+    tr.append(td);
+   }
+   tbody.append(tr);
+  }
+ }
+ $('queue-stats-empty').hidden=rows>0;
+}
+
 function renderUsageDays(days){
  const tbody=$('usage-days');
  tbody.replaceChildren();
@@ -588,12 +688,14 @@ function renderRequests(requests){
   const tr=document.createElement('tr');
   tr.className='req-row'+(expandedId===r.id?' open':'');
   const source=(r.client?`${r.client} · ${r.via==='public'?'public':'local'}`:'—')+(r.key&&r.key!=='Owner'?` · key: ${r.key}`:'');
-  for(const value of [new Date(r.at).toLocaleTimeString(),source,r.model+' / '+(r.effort||'default'),r.error||r.status,tokensCell(r)]){
+  const waited=r.queueMs>=1000?` · waited ${fmtWait(r.queueMs)} in queue`:'';
+  const jumped=r.queueJumped>0?' · went ahead of a larger request':'';
+  for(const value of [new Date(r.at).toLocaleTimeString(),source,r.model+' / '+(r.effort||'default'),(r.error||r.status)+waited+jumped,tokensCell(r)]){
    const td=document.createElement('td');
    td.textContent=value;
    tr.append(td);
   }
-  tr.children[3].className=r.status==='failed'?'failed':'ok';
+  tr.children[3].className=r.status==='failed'?'failed':r.status==='queued'?'warn':'ok';
   tr.addEventListener('click',()=>toggleDetail(r.id));
   $('requests').append(tr);
   if(expandedId===r.id)$('requests').append(buildDetailRow(r.id));
@@ -660,6 +762,8 @@ async function refresh(){
   docSnippets(s.baseUrl);
   renderUsage(s.usageTotals);
   renderUsageDays(s.usageDays);
+  renderQueue(s.queueLive,s.models);
+  renderQueueStats(s.queueStats);
   renderRequests(s.requests);
   renderKeys(s.apiKeys);
  }catch(error){

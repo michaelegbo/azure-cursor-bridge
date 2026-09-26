@@ -27,8 +27,16 @@ export function openDb(stateDir) {
       PRIMARY KEY(day, model)
     );
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS queue_daily(
+      day TEXT, model TEXT, admitted INTEGER DEFAULT 0, queued INTEGER DEFAULT 0,
+      wait_ms INTEGER DEFAULT 0, max_wait_ms INTEGER DEFAULT 0, jumped INTEGER DEFAULT 0,
+      throttled INTEGER DEFAULT 0,
+      PRIMARY KEY(day, model)
+    );
   `);
   try { db.exec(`ALTER TABLE guest_keys ADD COLUMN history TEXT`); } catch {}
+  try { db.exec(`ALTER TABLE requests ADD COLUMN queue_ms INTEGER`); } catch {}
+  try { db.exec(`ALTER TABLE requests ADD COLUMN queue_jumped INTEGER`); } catch {}
 
   const requestToRow = r => ({
     id: r.id, at: r.at, model: r.model ?? null, deployment: r.deployment ?? null,
@@ -38,12 +46,14 @@ export function openDb(stateDir) {
     input_tokens: r.usage?.inputTokens ?? null, cached_tokens: r.usage?.cachedTokens ?? null,
     output_tokens: r.usage?.outputTokens ?? null, error: r.error ?? null,
     context_window: r.contextWindow ?? null,
+    queue_ms: r.queueMs ?? null, queue_jumped: r.queueJumped ?? null,
   });
   const rowToRequest = row => ({
     id: row.id, at: row.at, model: row.model, deployment: row.deployment,
     protocol: row.protocol, effort: row.effort, bytes: row.bytes, status: row.status,
     client: row.client, via: row.via, key: row.key_label, durationMs: row.duration_ms,
     error: row.error, contextWindow: row.context_window,
+    queueMs: row.queue_ms ?? null, queueJumped: row.queue_jumped ?? null,
     usage: row.input_tokens === null && row.output_tokens === null ? null : {
       inputTokens: row.input_tokens || 0, cachedTokens: row.cached_tokens || 0,
       outputTokens: row.output_tokens || 0,
@@ -53,9 +63,9 @@ export function openDb(stateDir) {
   const api = {
     upsertRequest(entry) {
       const r = requestToRow(entry);
-      db.prepare(`INSERT INTO requests(id,at,model,deployment,protocol,effort,bytes,status,client,via,key_label,duration_ms,input_tokens,cached_tokens,output_tokens,error,context_window)
-        VALUES(:id,:at,:model,:deployment,:protocol,:effort,:bytes,:status,:client,:via,:key_label,:duration_ms,:input_tokens,:cached_tokens,:output_tokens,:error,:context_window)
-        ON CONFLICT(id) DO UPDATE SET status=:status,duration_ms=:duration_ms,input_tokens=:input_tokens,cached_tokens=:cached_tokens,output_tokens=:output_tokens,error=:error`).run(r);
+      db.prepare(`INSERT INTO requests(id,at,model,deployment,protocol,effort,bytes,status,client,via,key_label,duration_ms,input_tokens,cached_tokens,output_tokens,error,context_window,queue_ms,queue_jumped)
+        VALUES(:id,:at,:model,:deployment,:protocol,:effort,:bytes,:status,:client,:via,:key_label,:duration_ms,:input_tokens,:cached_tokens,:output_tokens,:error,:context_window,:queue_ms,:queue_jumped)
+        ON CONFLICT(id) DO UPDATE SET status=:status,duration_ms=:duration_ms,input_tokens=:input_tokens,cached_tokens=:cached_tokens,output_tokens=:output_tokens,error=:error,queue_ms=:queue_ms,queue_jumped=:queue_jumped`).run(r);
       db.prepare(`DELETE FROM requests WHERE id NOT IN (SELECT id FROM requests ORDER BY at DESC LIMIT 500)`).run();
     },
     listRequests(limit = 100) {
@@ -118,6 +128,25 @@ export function openDb(stateDir) {
         requests: r.requests || 0, inputTokens: r.input_tokens || 0,
         cachedTokens: r.cached_tokens || 0, outputTokens: r.output_tokens || 0,
       };
+      return res;
+    },
+    queueRecord(model, ticket) {
+      const day = new Date().toISOString().slice(0, 10);
+      const waited = Math.max(0, Math.round(ticket.waitedMs || 0));
+      db.prepare(`INSERT INTO queue_daily(day,model,admitted,queued,wait_ms,max_wait_ms,jumped) VALUES(?,?,1,?,?,?,?)
+        ON CONFLICT(day,model) DO UPDATE SET admitted=admitted+1,queued=queued+excluded.queued,wait_ms=wait_ms+excluded.wait_ms,max_wait_ms=MAX(max_wait_ms,excluded.max_wait_ms),jumped=jumped+excluded.jumped`)
+        .run(day, model, ticket.queued ? 1 : 0, waited, waited, ticket.jumpedAhead > 0 ? 1 : 0);
+    },
+    queueThrottle(model) {
+      const day = new Date().toISOString().slice(0, 10);
+      db.prepare(`INSERT INTO queue_daily(day,model,throttled) VALUES(?,?,1)
+        ON CONFLICT(day,model) DO UPDATE SET throttled=throttled+1`).run(day, model);
+    },
+    queueAggregate(daysBack) {
+      const cutoff = new Date(Date.now() - (daysBack - 1) * 86400000).toISOString().slice(0, 10);
+      const res = {};
+      for (const r of db.prepare(`SELECT model,SUM(admitted) admitted,SUM(queued) queued,SUM(wait_ms) wait_ms,MAX(max_wait_ms) max_wait_ms,SUM(jumped) jumped,SUM(throttled) throttled FROM queue_daily WHERE day>=? GROUP BY model`).all(cutoff))
+        res[r.model] = { admitted: r.admitted || 0, queued: r.queued || 0, waitMs: r.wait_ms || 0, maxWaitMs: r.max_wait_ms || 0, jumped: r.jumped || 0, throttled: r.throttled || 0 };
       return res;
     },
     usageDaily(days = 30) {

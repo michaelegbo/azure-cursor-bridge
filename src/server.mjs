@@ -3,12 +3,12 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
-import { createSink, sendJson, sendOpenAIError } from './openai-protocol.mjs';
+import { createSink, sendJson, sendOpenAIError, openSse } from './openai-protocol.mjs';
 import { BridgeError } from './errors.mjs';
 import { MODELS, routeModel, runAzure } from './azure-adapter.mjs';
 import { runClaudeCli } from './claude-cli-adapter.mjs';
 import { settings, EFFORTS, resolveEffort, outputLimit } from './model-settings.mjs';
-import { createRateLimiter } from './rate-limiter.mjs';
+import { createTpmQueue } from './rate-limiter.mjs';
 import { openDb } from './db.mjs';
 
 function defaultStateDir() {
@@ -50,7 +50,11 @@ function registry() {
 }
 
 const host = '127.0.0.1', port = Number(process.env.AZURE_BRIDGE_PORT || config.port || 17834);
-const rateLimiter = createRateLimiter();
+const tpmQueue = createTpmQueue();
+// Streams still waiting (TPM queue or Azure backoff) after this long get
+// their SSE headers early plus keepalives: Cloudflare drops a response that
+// sends no first byte within 100 seconds.
+const HOLD_OPEN_MS = 8000;
 if (!process.env.AZURE_BRIDGE_PORT) await writeFile(path.join(stateDir, 'proxy.pid'), String(process.pid));
 
 function clientLabel(req) {
@@ -130,6 +134,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/health') return sendJson(res, 200, { status: 'ok', service: 'azure-cursor-bridge', modelCount: registry().length, version: '3.2.0' });
     const who = await auth(req);
     if (!who) throw new BridgeError('Invalid bridge API key', 401);
+    if (req.method === 'GET' && url.pathname === '/bridge/queue') {
+      if (who.kind !== 'owner') throw new BridgeError('Only the owner key can read the queue', 403);
+      const models = registry();
+      return sendJson(res, 200, { at: new Date().toISOString(), deployments: tpmQueue.snapshot().map(d => ({ ...d, models: models.filter(m => m.deployment === d.deployment).map(m => m.id) })) });
+    }
     if (req.method === 'GET' && ['/v1/models', '/models'].includes(url.pathname)) return sendJson(res, 200, { object: 'list', data: registry().flatMap(m => [{ id: m.id, name: m.label }, ...EFFORTS.map(e => ({ id: `${m.id}-${e}`, name: `${m.label} · ${e}` }))].map(v => ({ id: v.id, object: 'model', created: 1789170000, owned_by: 'azure', name: v.name, context_window: m.contextWindow, max_input_tokens: m.maxInputTokens ?? m.contextWindow, max_output_tokens: m.maxOutputTokens || 128000, tokens_per_minute: m.tokensPerMinute || 0, reasoning_efforts: EFFORTS }))) });
     if (req.method !== 'POST' || !['/v1/chat/completions', '/chat/completions', '/v1/responses', '/responses'].includes(url.pathname)) throw new BridgeError('Not found', 404);
     let bytes = 0; const chunks = []; for await (const chunk of req) { bytes += chunk.length; if (bytes > 32 * 1024 * 1024) throw new BridgeError('Request too large', 413); chunks.push(chunk); }
@@ -144,23 +153,45 @@ const server = http.createServer(async (req, res) => {
     if (protocol === 'chat' && !Array.isArray(body.messages)) throw new BridgeError('messages must be an array', 400);
     let preferences; try { preferences = settings(db.settingGet('model-settings') || {}); } catch { preferences = settings(); }
     const effort = resolveEffort(body, route, preferences);
-    if (route.protocol !== 'claude-cli') rateLimiter.take(route.deployment, route.tokensPerMinute, Math.ceil(bytes / 4) + outputLimit(body, route));
+    const estimatedInputTokens = Math.ceil(bytes / 4);
     entry = { effort, contextWindow: route.contextWindow, id: randomUUID(), at: new Date().toISOString(), model: route.id, deployment: route.deployment, protocol, bytes, status: 'running', client: clientLabel(req), via: req.headers['cf-connecting-ip'] ? 'public' : 'local', key: who.label };
-    const started = Date.now();
+    let started = Date.now();
+    let ticket = null;
     db.upsertRequest(entry);
     recordDetail(entry, body, req);
     const abort = new AbortController(); res.on('close', () => { if (!res.writableEnded) abort.abort(); });
     sink = createSink(protocol, res, { stream: Boolean(body.stream), onLifecycle: ({ status, error }) => {
       entry.status = status; entry.durationMs = Date.now() - started; entry.usage = sink.session?.usage;
-      if (entry.usage && status !== 'running' && !countedEntries.has(entry)) { countedEntries.add(entry); try { db.usageAdd(entry.model, entry.usage); } catch {} }
+      if (entry.usage && status !== 'running' && !countedEntries.has(entry)) { countedEntries.add(entry); try { db.usageAdd(entry.model, entry.usage); } catch {} ticket?.settle(entry.usage.inputTokens); }
       if (error) entry.error = String(error.message).replaceAll(key, '[redacted]').slice(0, 500);
       try { db.upsertRequest(entry); } catch {}
     } });
+    const holdOpen = body.stream ? setTimeout(() => { if (!res.headersSent && !res.writableEnded) { openSse(res); res.write(': waiting for token budget\n\n'); } }, HOLD_OPEN_MS) : null;
     const heartbeat = setInterval(() => { if (res.headersSent && !res.writableEnded) res.write(': keepalive\n\n'); }, 15000);
     try {
+      // Models with a TPM budget wait here until their estimated tokens fit;
+      // models without one pass straight through.
+      ticket = await tpmQueue.acquire({
+        deployment: route.deployment,
+        tokensPerMinute: route.tokensPerMinute,
+        estimatedTokens: estimatedInputTokens + outputLimit(body, route),
+        estimatedInputTokens,
+        signal: abort.signal,
+        info: { model: route.id, client: entry.client, requestId: entry.id },
+        onQueued: () => { entry.status = 'queued'; try { db.upsertRequest(entry); } catch {} },
+      });
+      if (!ticket.freestyle) {
+        entry.queueMs = ticket.waitedMs;
+        entry.queueJumped = ticket.jumpedAhead;
+        try { db.queueRecord(route.id, ticket); } catch {}
+      }
+      entry.status = 'running';
+      started = Date.now();
+      try { db.upsertRequest(entry); } catch {}
+      const onThrottle = ms => { tpmQueue.pause(route.deployment, ms); if (route.tokensPerMinute > 0) { try { db.queueThrottle(route.id); } catch {} } };
       if (route.protocol === 'claude-cli') await runClaudeCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir });
-      else await runAzure({ body, protocol, route, key, endpoint, signal: abort.signal, sink, preferences });
-    } finally { clearInterval(heartbeat); }
+      else await runAzure({ body, protocol, route, key, endpoint, signal: abort.signal, sink, preferences, onThrottle });
+    } finally { clearInterval(heartbeat); clearTimeout(holdOpen); }
   } catch (error) {
     if (entry) { entry.status = 'failed'; entry.error = String(error.message).replaceAll(key || ' ', '[redacted]').slice(0, 500); try { db.upsertRequest(entry); } catch {} }
     if (sink) sink.error(error); else sendOpenAIError(res, error);

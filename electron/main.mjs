@@ -59,6 +59,14 @@ async function health() {
   if (!config?.port) return null;
   try { return await (await fetch(`http://127.0.0.1:${config.port}/health`, { signal: AbortSignal.timeout(2000) })).json(); } catch { return null; }
 }
+async function liveQueue() {
+  const config = await json('config.json');
+  if (!config?.port || !config.apiKey) return null;
+  try {
+    const r = await fetch(`http://127.0.0.1:${config.port}/bridge/queue`, { headers: { authorization: `Bearer ${config.apiKey}` }, signal: AbortSignal.timeout(1500) });
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}
 
 async function runLifecycle(action) {
   await lifecycleLog(`${action} requested`);
@@ -221,6 +229,8 @@ ipcMain.handle('azure:snapshot', async () => {
     pricingIsDefault: !db.settingGet('pricing'),
     usageTotals: aggregatePeriods(),
     usageDays: db.usageDaily(30),
+    queueLive: await liveQueue(),
+    queueStats: { today: db.queueAggregate(1), week: db.queueAggregate(7) },
     apiKeys: [{ id: 'owner', label: 'Owner key', masked: maskKey(config?.apiKey), permanent: true, status: 'active' }, ...db.guestList().map(k => ({ id: k.id, label: k.label, masked: maskKey(k.key), status: keyStatus(k), expiresAt: k.expiresAt || null, requests: k.requests || 0, lastUsedAt: k.lastUsedAt || null, history: (k.history || []).map(h => ({ v: h.v, createdAt: h.createdAt, masked: maskKey(h.key) })) }))],
     requests: db.listRequests(100),
   };

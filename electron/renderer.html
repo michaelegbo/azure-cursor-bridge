@@ -98,6 +98,20 @@
   .wizard-hint{font-size:13px;color:#8d99a5}
   #wiz-message{color:#a6d6f9}
   .mini-bar{height:6px;border-radius:3px;background:#5b8dd9;min-width:2px}
+  .subhead{font-size:15px;margin:20px 0 6px;color:#cdd6dd;font-weight:600}
+  .warn{color:#e6c77d}
+  .queue-model{border:1px solid #2f373e;border-radius:8px;padding:12px 14px;margin:10px 0}
+  .queue-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:baseline}
+  .queue-head b{font-size:15px}
+  .budget-track{height:10px;border-radius:5px;background:#0d1114;border:1px solid #2a3238;overflow:hidden;margin:8px 0 4px}
+  .budget-fill{height:100%;background:#4db6a0;transition:width .4s ease}
+  .budget-fill.low{background:#c9a24b}
+  .budget-fill.empty{background:#c96b5b}
+  .queue-meta{font-size:13px;color:#a8b5c1}
+  .queue-waiting td{font-size:13px}
+  .badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:9px;border:1px solid #50606d;color:#cdd6dd;margin-left:6px}
+  .badge.warn{border-color:#c9a24b;color:#e6c77d}
+  .badge.hot{border-color:#c96b5b;color:#ffad9c}
   .model-form{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
   .model-form label{margin:0;font-size:12px;color:#a8b5c1}
   .model-form input,.model-form select{display:block;width:100%;margin-top:4px;padding:7px;background:#222c34;color:#eee;border:1px solid #647582;border-radius:5px;font:inherit}
@@ -157,7 +171,7 @@
   </section>
   <section class="panel">
    <h2>Azure and custom models</h2>
-   <p>Edit Azure Astra, Azure Sol, and Azure Opus here to set a local tokens-per-minute budget and maximum output. Their context windows are fixed to the models' published capabilities. Add other deployments below. A TPM setting only limits traffic through this bridge; it cannot raise your Azure quota, which may be shared with other clients or deployments. Set TPM to 0 to leave local throttling off.</p>
+   <p>Edit Azure Astra, Azure Sol, and Azure Opus here to set a local tokens-per-minute budget and maximum output. Their context windows are fixed to the models' published capabilities. Add other deployments below. With a TPM set, requests that would exceed it wait in a queue until they fit instead of failing (see Usage &amp; cost → Rate-limit queue). A TPM setting only paces traffic through this bridge; it cannot raise your Azure quota, which may be shared with other clients or deployments. Set TPM to 0 to skip the queue entirely.</p>
    <div class="model-table-wrap"><table><thead><tr><th>Id</th><th>Deployment</th><th>Protocol</th><th>Context</th><th>Max output</th><th>TPM budget</th><th>Default effort</th><th>Actions</th></tr></thead><tbody id="custom-models"></tbody></table></div>
    <div class="model-form">
     <label>Model id<input id="cm-id" placeholder="azure-haiku" maxlength="40"></label>
@@ -303,6 +317,14 @@
   </section>
   </div>
   <div class="page" data-page="usage">
+  <section class="panel">
+   <h2>Rate-limit queue</h2>
+   <p>Models with a tokens-per-minute budget never fail on it: a request that doesn't fit waits until it does, while smaller requests that fit go straight in. After waiting 10 seconds, the oldest request gets priority, so nothing starves. If Azure itself throttles, the model's queue pauses for the time Azure asks. Models without a budget skip the queue entirely.</p>
+   <div id="queue-live"></div>
+   <h3 class="subhead">Queue history</h3>
+   <table><thead><tr><th>Model</th><th>Period</th><th>Requests</th><th>Had to wait</th><th>Avg / max wait</th><th>Went ahead of a waiter</th><th>Azure throttles</th></tr></thead><tbody id="queue-stats"></tbody></table>
+   <div id="queue-stats-empty" class="empty" hidden>No budgeted requests yet — set a TPM on a model's card to enable queuing for it.</div>
+  </section>
   <section class="panel">
    <h2>Usage &amp; cost</h2>
    <p>Token totals for everything that passes through the bridge, bucketed per day. Enter <b>your</b> Azure rates in US dollars per 1 million tokens (from the Azure portal / your agreement) and the bridge estimates cost — estimates, not invoices. Counting starts from when this feature was added.</p>
