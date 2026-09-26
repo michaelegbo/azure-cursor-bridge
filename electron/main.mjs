@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { createSecrets } from './secrets.mjs';
 import { createRuntime } from './runtime.mjs';
+import { createCodexSwitch } from './codex-switch.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const icon = path.join(here, 'icon.png');
@@ -19,7 +20,8 @@ function defaultStateDir() {
 }
 const state = defaultStateDir();
 await mkdir(state, { recursive: true });
-const { settings, LIMITS, EFFORTS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/model-settings.mjs')).href);
+const codexSwitch = createCodexSwitch({ stateDir: state, assetsDir: here });
+const { settings, EFFORTS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/model-settings.mjs')).href);
 const { MODELS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/azure-adapter.mjs')).href);
 const { openDb } = await import(pathToFileURL(path.join(bridgeRoot, 'src/db.mjs')).href);
 
@@ -91,6 +93,7 @@ function queueLifecycle(action) {
 // Shown as editable defaults; the user's own agreement/region rates override.
 const DEFAULT_PRICING = {
   'azure-astra': { input: 10, cachedInput: 1, output: 50 },
+  'azure-sol': { input: 2, cachedInput: 0.2, output: 10 },
   'azure-opus': { input: 5, cachedInput: 0.5, output: 25 },
 };
 const maskKey = v => v ? `${v.slice(0, 8)}…${v.slice(-4)}` : '';
@@ -104,7 +107,8 @@ function aggregatePeriods() {
 const CUSTOM_MODEL_ID = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/;
 function modelRegistry() {
-  const builtins = MODELS.map(m => ({ ...m, ...LIMITS[m.id], builtin: true }));
+  const saved = settings(db.settingGet('model-settings') || {});
+  const builtins = MODELS.map(m => ({ ...m, ...saved[m.id], defaultEffort: saved[m.id].effort, builtin: true }));
   const taken = new Set(builtins.flatMap(m => [m.id, m.deployment]));
   const custom = (db.settingGet('custom-models') || []).filter(m => m && !taken.has(m.id));
   return [...builtins, ...custom.map(m => ({ ...m, builtin: false }))];
@@ -112,6 +116,18 @@ function modelRegistry() {
 ipcMain.handle('azure:models', async (_e, cmd) => {
   const action = cmd?.action;
   const custom = db.settingGet('custom-models') || [];
+  if (action === 'save-builtin') {
+    const id = String(cmd.model?.id || '');
+    if (!MODELS.some(m => m.id === id)) throw Error('Built-in model not found');
+    const current = db.settingGet('model-settings') || {};
+    const validated = settings({ ...current, [id]: {
+      effort: cmd.model.defaultEffort,
+      maxOutputTokens: cmd.model.maxOutputTokens,
+      tokensPerMinute: cmd.model.tokensPerMinute,
+    } });
+    db.settingSet('model-settings', validated);
+    return { message: `Model “${id}” settings saved — they apply to the next request.` };
+  }
   if (action === 'delete') {
     const id = String(cmd.id || '');
     if (!custom.some(m => m.id === id)) throw Error('Model not found');
@@ -128,12 +144,14 @@ ipcMain.handle('azure:models', async (_e, cmd) => {
     if (!deployment || deployment.length > 80) throw Error('Enter the Azure deployment name');
     const protocol = cmd.model?.protocol;
     if (!['responses', 'anthropic', 'chat', 'claude-cli'].includes(protocol)) throw Error('Pick the API protocol: responses (OpenAI models), anthropic (Claude on Azure), chat (chat-completions-only deployments like model-router), or claude-cli (your Claude subscription via the Claude CLI)');
-    const contextWindow = Number(cmd.model?.contextWindow) || 1000000;
-    if (contextWindow < 1000 || contextWindow > 10000000) throw Error('Context window must be between 1,000 and 10,000,000 tokens');
-    const maxOutputTokens = Number(cmd.model?.maxOutputTokens) || 128000;
-    if (maxOutputTokens < 256 || maxOutputTokens > 128000) throw Error('Max output must be between 256 and 128,000 tokens');
+    const contextWindow = Number(cmd.model?.contextWindow);
+    if (!Number.isInteger(contextWindow) || contextWindow < 1000 || contextWindow > 10000000) throw Error('Context window must be between 1,000 and 10,000,000 tokens');
+    const maxOutputTokens = Number(cmd.model?.maxOutputTokens);
+    if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < 256 || maxOutputTokens > 128000) throw Error('Max output must be between 256 and 128,000 tokens');
+    const tokensPerMinute = Number(cmd.model?.tokensPerMinute ?? 0);
+    if (!Number.isInteger(tokensPerMinute) || (tokensPerMinute !== 0 && tokensPerMinute < 1000) || tokensPerMinute > 100000000) throw Error('Tokens per minute must be 0 (off) or between 1,000 and 100,000,000');
     const defaultEffort = EFFORTS.includes(cmd.model?.defaultEffort) ? cmd.model.defaultEffort : 'medium';
-    const entry = { id, deployment, label: String(cmd.model?.label || '').trim().slice(0, 60) || id, protocol, contextWindow, maxOutputTokens, defaultEffort };
+    const entry = { id, deployment, label: String(cmd.model?.label || '').trim().slice(0, 60) || id, protocol, contextWindow, maxOutputTokens, tokensPerMinute, defaultEffort };
     const existing = custom.findIndex(m => m.id === id);
     if (existing >= 0) custom[existing] = entry; else custom.push(entry);
     db.settingSet('custom-models', custom);
@@ -195,6 +213,8 @@ ipcMain.handle('azure:snapshot', async () => {
     tunnelName: tunnel?.tunnelName || '',
     tunnel: startStatus?.tunnel || null,
     models: modelRegistry(),
+    codex: process.platform === 'win32' ? await codexSwitch.status().catch(error => ({ enabled: false, error: error.message })) : { enabled: false, error: 'Codex switching is currently available on Windows.' },
+    codexRestart: await readFile(path.join(state, 'codex-restart-status.txt'), 'utf8').catch(() => ''),
     claudeCli: claudeCliStatus(),
     azureKey: await azureKeyInfo(),
     pricing: db.settingGet('pricing') || DEFAULT_PRICING,
@@ -206,7 +226,31 @@ ipcMain.handle('azure:snapshot', async () => {
   };
 });
 
-ipcMain.handle('azure:settings', async (_e, value) => { const validated = settings(value); db.settingSet('model-settings', validated); return validated; });
+ipcMain.handle('azure:codex-switch', async (_e, enabled) => {
+  if (process.platform !== 'win32') throw Error('Codex switching is currently available on Windows.');
+  if (typeof enabled !== 'boolean') throw Error('Choose bridge mode on or off.');
+  const current = await codexSwitch.status();
+  if (current.enabled === enabled) return { ...current, message: 'Codex is already in this mode.' };
+  if (enabled) {
+    const config = await json('config.json');
+    if (!config?.apiKey) throw Error('The bridge owner key is missing.');
+    const result = await health();
+    if (result?.service !== 'azure-cursor-bridge') throw Error('Start the bridge before switching Codex to it.');
+    const models = modelRegistry();
+    await codexSwitch.enable(models, Number(config.port));
+    await mirrorWrite('codex-model-catalog.json', await readFile(path.join(state, 'codex-model-catalog.json'), 'utf8'));
+    var switchNote = '';
+  } else { var switchNote = (await codexSwitch.disable()).note || ''; }
+  const { spawn } = await import('node:child_process');
+  const statusPath = path.join(state, 'codex-restart-status.txt');
+  await writeFile(statusPath, 'Restart pending');
+  const helper = path.join(here, 'restart-codex.ps1');
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', helper, '-StatusPath', statusPath], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.unref();
+  return { enabled, message: `Codex will restart now. ${enabled ? 'Bridge models' : 'Your previous OpenAI models'} will be available when it reopens.${switchNote ? ` ${switchNote}` : ''}` };
+});
+
+ipcMain.handle('azure:settings', async (_e, value) => { const validated = settings({ ...(db.settingGet('model-settings') || {}), ...value }); db.settingSet('model-settings', validated); return validated; });
 
 ipcMain.handle('azure:pricing', async (_e, value) => {
   const known = new Set(modelRegistry().map(m => m.id));

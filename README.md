@@ -13,6 +13,7 @@ Grab the latest installer from the [Releases page](https://github.com/michaelegb
 On first launch a setup wizard asks for your Azure endpoint and API key — that's all the configuration needed.
 
 - `azure-astra`: `gpt-6-astra`, using Azure Responses.
+- `azure-sol`: `gpt-6-sol`, using Azure Responses.
 - `azure-opus`: `claude-opus-5`, using Azure Anthropic Messages.
 
 Everything ships in one installer: the desktop app, the proxy backend (runs on Electron's bundled Node — no separate Node installation), an embedded SQLite database (`node:sqlite` — no separate database installation), and a bundled `cloudflared` for the public tunnel.
@@ -33,7 +34,8 @@ The bridge accepts Chat Completions and stateless Responses requests, including 
 - Versioned Azure upstream key: reveal, test against Azure, replace, revert to any version.
 - Per-request breakdowns (scaffolding vs conversation, cache hits) with AI analysis.
 - Usage totals and cost estimation from your own Azure rates.
-- Reasoning effort: per-model defaults in the app, client-sent settings honored, and effort-suffixed model aliases (`azure-astra-high`, `azure-opus-max`, …).
+- Reasoning effort: per-model defaults in the app, client-sent settings honored, and effort-suffixed model aliases (`azure-astra-high`, `azure-sol-high`, `azure-opus-max`, …).
+- **Codex model source** switch (Windows): turn it on to use every configured bridge model in local Codex, or off to restore the prior OpenAI model settings. The app writes a local-only provider and model catalog, reads the existing owner key through a short-lived PowerShell auth command, and restarts Codex. Switching interrupts active Codex tasks; a conflict with manually changed Codex settings stops restoration instead of overwriting those changes. Cloud Codex tasks cannot call a bridge on this computer through localhost.
 
 ## Build
 

@@ -22,12 +22,13 @@ export function createSecrets(stateDir) {
   const has = name => existsSync(encPath(name));
 
   // Legacy migration: earlier Windows-only versions stored secrets as
-  // PowerShell SecureString DPAPI blobs. Decrypt each once and re-encrypt
-  // with safeStorage. Only runs on Windows and only for missing secrets.
+  // PowerShell SecureString DPAPI blobs. Recover when a safeStorage file is
+  // present but unreadable too (for example after a Windows account change).
   function dpapiDecrypt(file) {
     return new Promise((resolve, reject) => {
       const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-      const child = spawn(ps, ['-NoProfile', '-NonInteractive', '-Command', "$s=(Get-Content -LiteralPath $env:AZ_FILE -Raw).Trim() | ConvertTo-SecureString; $p=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s); try {[Console]::Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR($p))} finally {[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p)}"], { env: { ...process.env, AZ_FILE: file }, windowsHide: true });
+      const modulePath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'Modules');
+      const child = spawn(ps, ['-NoProfile', '-NonInteractive', '-Command', "$s=(Get-Content -LiteralPath $env:AZ_FILE -Raw).Trim() | ConvertTo-SecureString; $p=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s); try {[Console]::Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR($p))} finally {[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p)}"], { env: { ...process.env, PSModulePath: modulePath, AZ_FILE: file }, windowsHide: true });
       let out = '', err = '';
       child.stdout.on('data', d => out += d);
       child.stderr.on('data', d => err += d);
@@ -50,7 +51,7 @@ export function createSecrets(stateDir) {
       }
     }
     for (const [name, file] of pairs) {
-      if (has(name) || !existsSync(file)) continue;
+      if (!existsSync(file) || await get(name)) continue;
       try { await set(name, await dpapiDecrypt(file)); } catch {}
     }
   }

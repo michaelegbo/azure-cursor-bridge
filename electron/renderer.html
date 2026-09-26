@@ -101,6 +101,8 @@
   .model-form{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
   .model-form label{margin:0;font-size:12px;color:#a8b5c1}
   .model-form input,.model-form select{display:block;width:100%;margin-top:4px;padding:7px;background:#222c34;color:#eee;border:1px solid #647582;border-radius:5px;font:inherit}
+  .model-form input:disabled,.model-form select:disabled{opacity:.7;cursor:not-allowed}
+  .model-table-wrap{overflow-x:auto}
   #cm-message{color:#a6d6f9}
   @media(max-width:880px){.model-form{grid-template-columns:1fr}}
   @keyframes toggle-working{to{transform:translateX(14px)}}
@@ -136,6 +138,16 @@
    <div id="message" role="status"></div>
    <p>This is a permanent URL — it stays the same across restarts and reboots. Use it as the OpenAI base URL override in Cursor and the provider base URL in Codex. Keep this computer on while using the bridge.</p>
   </section>
+  <section class="panel" aria-labelledby="codex-heading">
+   <h2 id="codex-heading">Codex model source</h2>
+   <p>Switch Codex between your usual OpenAI models and every model configured in this bridge. Changing modes restarts the Codex desktop app and interrupts running tasks.</p>
+   <div class="actions">
+    <button class="bridge-toggle" id="codex-toggle" type="button" role="switch" aria-checked="false" aria-label="Use Azure Cursor Bridge in Codex"><span class="toggle-track" aria-hidden="true"><span class="toggle-knob"></span></span><span class="toggle-label">Off</span></button>
+    <span id="codex-mode">Checking Codex settings…</span>
+   </div>
+   <p id="codex-model-list"></p>
+   <p id="codex-message" role="status"></p>
+  </section>
   <section class="models" id="model-cards"></section>
   <section class="panel">
    <button id="save-settings">Save model settings</button>
@@ -144,10 +156,9 @@
    <p>Full Azure context is available through the bridge. Cursor controls the history it sends and may compact earlier. No local truncation is applied.</p>
   </section>
   <section class="panel">
-   <h2>Custom models</h2>
-   <p>Expose any other deployment on your Azure resource as a bridge model. Pick the protocol that matches the deployment: <b>OpenAI (responses)</b> for GPT-family models, <b>Anthropic (messages)</b> for Claude-family models. New models are live immediately, appear in <code>/v1/models</code> with effort-suffixed variants, and support pricing and usage tracking — add the model id to Cursor's model list to use it there.</p>
-   <table><thead><tr><th>Id</th><th>Label</th><th>Deployment</th><th>Protocol</th><th>Context</th><th>Default effort</th><th>Actions</th></tr></thead><tbody id="custom-models"></tbody></table>
-   <div id="custom-empty" class="empty">No custom models yet — the two built-ins are always available.</div>
+   <h2>Azure and custom models</h2>
+   <p>Edit Azure Astra, Azure Sol, and Azure Opus here to set a local tokens-per-minute budget and maximum output. Their context windows are fixed to the models' published capabilities. Add other deployments below. A TPM setting only limits traffic through this bridge; it cannot raise your Azure quota, which may be shared with other clients or deployments. Set TPM to 0 to leave local throttling off.</p>
+   <div class="model-table-wrap"><table><thead><tr><th>Id</th><th>Deployment</th><th>Protocol</th><th>Context</th><th>Max output</th><th>TPM budget</th><th>Default effort</th><th>Actions</th></tr></thead><tbody id="custom-models"></tbody></table></div>
    <div class="model-form">
     <label>Model id<input id="cm-id" placeholder="azure-haiku" maxlength="40"></label>
     <label>Label<input id="cm-label" placeholder="Azure · Claude Haiku" maxlength="60"></label>
@@ -155,9 +166,10 @@
     <label>Protocol<select id="cm-protocol"><option value="responses">OpenAI (responses)</option><option value="anthropic">Anthropic (messages)</option><option value="chat">OpenAI chat completions (model-router etc.)</option><option value="claude-cli">Claude CLI (your Claude subscription)</option></select></label>
     <label>Context window<input id="cm-context" type="number" min="1000" max="10000000" value="1000000"></label>
     <label>Max output tokens<input id="cm-maxout" type="number" min="256" max="128000" value="128000"></label>
+    <label>Tokens per minute (0 = off)<input id="cm-tpm" type="number" min="0" max="100000000" step="1" value="0"></label>
     <label>Default effort<select id="cm-effort"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label>
    </div>
-   <div class="actions"><button id="cm-save">Add / update model</button><span id="cm-message" role="status"></span></div>
+   <div class="actions"><button id="cm-save">Add / update model</button><button id="cm-cancel" type="button" hidden>Cancel edit</button><span id="cm-message" role="status"></span></div>
   </section>
   <section class="panel">
    <h2>Claude account</h2>
@@ -173,13 +185,13 @@
    <div class="kv"><span>Local base URL</span><code id="detail-local">—</code></div>
    <div class="kv"><span>Authentication</span><code>Authorization: Bearer &lt;owner key or guest key&gt;</code></div>
    <div class="kv"><span>Tunnel</span><code id="detail-tunnel">—</code></div>
-   <p>Routes: <code>GET /health</code> (no auth) · <code>GET /v1/models</code> · <code>POST /v1/chat/completions</code> · <code>POST /v1/responses</code>. Models: <code>azure-astra</code> (GPT-6 Astra) and <code>azure-opus</code> (Claude Opus 5). Add an effort suffix to pick reasoning per request — <code>azure-astra-low</code>, <code>azure-opus-max</code>, etc. (low / medium / high / xhigh / max). Bare model names use the Reasoning mode saved above; a client-sent reasoning setting (Codex) is honored too.</p>
+   <p>Routes: <code>GET /health</code> (no auth) · <code>GET /v1/models</code> · <code>POST /v1/chat/completions</code> · <code>POST /v1/responses</code>. Azure models: <code>azure-astra</code> (GPT-6 Astra), <code>azure-sol</code> (GPT-6 Sol), and <code>azure-opus</code> (Claude Opus 5). Add an effort suffix to pick reasoning per request — <code>azure-astra-low</code>, <code>azure-sol-high</code>, <code>azure-opus-max</code>, etc. (low / medium / high / xhigh / max). Bare model names use the Reasoning mode saved above; a client-sent reasoning setting (Codex) is honored too.</p>
    <details>
     <summary>Connect Cursor</summary>
     <ol>
      <li>Cursor Settings → Models → API Keys: enable <b>OpenAI API Key</b> and paste the bridge key (use “Copy bridge key” above).</li>
      <li>Turn on <b>Override OpenAI Base URL</b> and paste the public base URL (use “Copy base URL” above).</li>
-     <li>Add custom models named <code>azure-astra</code> and <code>azure-opus</code>, then pick one in chat.</li>
+     <li>Add bridge model names <code>azure-astra</code>, <code>azure-sol</code>, and <code>azure-opus</code> in Cursor, then pick one in chat.</li>
      <li>To control reasoning from Cursor's model picker, add effort-suffixed names like <code>azure-astra-high</code> or <code>azure-opus-max</code> — the suffix overrides the bridge's default effort for that request.</li>
     </ol>
    </details>
@@ -194,19 +206,19 @@
     <p>These models run through the local Claude Code CLI on your Claude subscription. Use them from any client exactly like the Azure models — same base URL, same bridge key. The <code>bridge-</code> prefix avoids clashing with clients' own built-in Claude model names (Cursor intercepts bare <code>claude-*</code> names). Model names:</p>
     <ol>
      <li><code>bridge-claude-fable</code> — Claude Fable 5.1 (most capable)</li>
-     <li><code>bridge-claude-opus</code> — Claude Opus 5 (also available Azure-billed as <code>azure-opus</code>)</li>
+     <li><code>bridge-claude-opus</code> — Claude Opus 5.5 through the local Claude CLI (<code>azure-opus</code> remains the separate Azure Opus 5 deployment)</li>
      <li><code>bridge-claude-sonnet</code> — Claude Sonnet 5</li>
      <li><code>bridge-claude-haiku</code> — Claude Haiku 4.5 (fastest)</li>
     </ol>
-    <p><b>Effort</b> works like every bridge model — suffix the name (<code>bridge-claude-fable-max</code>, <code>bridge-claude-haiku-low</code>), send a client reasoning setting, or rely on the model card default. For Claude models, effort maps to a thinking-token budget: low = thinking off, medium = 4,096, high = 16,384, xhigh = 32,768, max = 63,999 thinking tokens.</p>
+    <p><b>Effort</b> works like every bridge model — suffix the name (<code>bridge-claude-opus-max</code>, <code>bridge-claude-haiku-low</code>), send a client reasoning setting, or rely on the model card default. Opus 5.5 uses adaptive thinking at every effort level; low / medium / high / xhigh / max control its depth. Other Claude CLI models use thinking-token budgets: low = thinking off, medium = 4,096, high = 16,384, xhigh = 32,768, max = 63,999.</p>
     <p><b>Tool calling:</b> client tools (Cursor agent mode, Codex) work via emulation — the bridge passes the client's tool schemas to Claude in the system prompt with a strict call format, converts Claude's calls into standard OpenAI <code>tool_calls</code>, and feeds results back on the next request. One tool call per reply; Claude Code's own local tools are always disabled for bridge requests.</p>
     <p><b>Requirements &amp; limits:</b> the Claude CLI must be installed and logged in on the bridge machine (Overview → Claude account → “Log in with Claude”). Usage draws on your Claude subscription limits, including requests made with guest keys.</p>
    </details>
    <details>
     <summary>Control reasoning effort</summary>
-    <p>Both models support five reasoning levels: <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code> and <code>max</code>. Higher levels think longer and use more output tokens. There are three ways to choose, and the most specific one wins:</p>
+    <p>The Azure models support five reasoning levels: <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code> and <code>max</code>. Higher levels think longer and use more output tokens. There are three ways to choose, and the most specific one wins:</p>
     <ol>
-     <li><b>Effort in the model name</b> (strongest) — pick a suffixed model such as <code>azure-astra-low</code>, <code>azure-astra-max</code> or <code>azure-opus-high</code>. This is how you control effort from Cursor's model picker: all ten variants are registered there, alongside the bare names. Works from any OpenAI-compatible client.</li>
+     <li><b>Effort in the model name</b> (strongest) — pick a suffixed model such as <code>azure-astra-low</code>, <code>azure-sol-max</code> or <code>azure-opus-high</code>. This is how you control effort from Cursor's model picker. Works from any OpenAI-compatible client.</li>
      <li><b>The client's own reasoning setting</b> — Codex has a native effort selector next to the model name and sends your choice with every request; the bridge honors it. API callers can send <code>reasoning_effort</code> (chat) or <code>reasoning.effort</code> (responses).</li>
      <li><b>The bridge default</b> (weakest) — the Reasoning mode dropdowns above apply when a bare model name is used and the client sends no preference. This is what Cursor's bare <code>azure-astra</code> uses.</li>
     </ol>

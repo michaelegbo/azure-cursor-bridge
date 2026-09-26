@@ -81,9 +81,17 @@ export async function runClaudeCli({ body, protocol, route, effort, sink, signal
   // "call" the emulated client tools above, and bridge callers can never
   // drive real tools on this machine.
   const args = ['-p', '--model', route.deployment, '--output-format', 'stream-json', '--include-partial-messages', '--verbose', '--max-turns', '1', '--strict-mcp-config', '--restricted', '--tools', '', '--system-prompt-file', systemFile];
+  const cliEnv = { ...process.env, CLAUDE_CODE_DISABLE_AUTOUPDATE: '1' };
+  if (route.deployment === 'claude-opus-5-5') {
+    // Opus 5.5 always uses adaptive thinking; effort is its thinking control.
+    args.push('--effort', effort || 'medium');
+    delete cliEnv.MAX_THINKING_TOKENS;
+  } else {
+    cliEnv.MAX_THINKING_TOKENS = String(CLI_EFFORT_THINKING[effort] ?? 16384);
+  }
   const child = spawn(claudeCliPath(), args, {
     cwd: workDir,
-    env: { ...process.env, MAX_THINKING_TOKENS: String(CLI_EFFORT_THINKING[effort] ?? 16384), CLAUDE_CODE_DISABLE_AUTOUPDATE: '1' },
+    env: cliEnv,
     windowsHide: true,
   });
   child.stdin.end(prompt);

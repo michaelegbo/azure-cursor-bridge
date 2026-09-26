@@ -1,6 +1,7 @@
 let settingsLoaded=false;
 let actionPending=false;
 let bridgeRunning=false;
+let codexPending=false;
 let expandedId=null;
 let lastRequests=[];
 const detailCache=new Map();
@@ -97,7 +98,7 @@ function renderUsageDays(days){
 let lastModels=[];
 let modelCardsSig='';
 function renderModelCards(models,modelSettings){
- const sig=(models||[]).map(m=>m.id).join(',');
+ const sig=JSON.stringify((models||[]).map(m=>[m.id,m.contextWindow,m.maxInputTokens,m.maxOutputTokens,m.tokensPerMinute,m.defaultEffort,modelSettings?.[m.id]?.effort]));
  if(sig===modelCardsSig)return;
  modelCardsSig=sig;
  const grid=$('model-cards');
@@ -127,7 +128,9 @@ function renderModelCards(models,modelSettings){
   ctx.textContent=`Maximum context: ${(m.contextWindow||0).toLocaleString()} tokens`+(m.maxInputTokens?` (up to ${m.maxInputTokens.toLocaleString()} input)`:'');
   const out=document.createElement('p');
   out.textContent=`Output allowance: up to ${(m.maxOutputTokens||128000).toLocaleString()} tokens`;
-  card.append(name,idCode,dep,label,sel,ctx,out);
+  const tpm=document.createElement('p');
+  tpm.textContent=`Local TPM budget: ${m.tokensPerMinute?m.tokensPerMinute.toLocaleString():'Off'}`;
+  card.append(name,idCode,dep,label,sel,ctx,out,tpm);
   grid.append(card);
  }
 }
@@ -159,14 +162,35 @@ function renderPricingForm(models,pricing){
  }
 }
 
+let editingBuiltinId=null;
+function resetModelForm(){
+ editingBuiltinId=null;
+ for(const id of ['cm-id','cm-label','cm-deployment','cm-protocol','cm-context'])$(id).disabled=false;
+ $('cm-id').value='';$('cm-label').value='';$('cm-deployment').value='';
+ $('cm-protocol').value='responses';$('cm-context').value=1000000;
+ $('cm-maxout').value=128000;$('cm-tpm').value=0;$('cm-effort').value='medium';
+ $('cm-save').textContent='Add / update model';$('cm-cancel').hidden=true;
+}
+function editModel(m){
+ editingBuiltinId=m.builtin?m.id:null;
+ $('cm-id').value=m.id;$('cm-label').value=m.label||'';$('cm-deployment').value=m.deployment;
+ $('cm-protocol').value=m.protocol;$('cm-context').value=m.contextWindow||1000000;
+ $('cm-maxout').value=m.maxOutputTokens||128000;$('cm-tpm').value=m.tokensPerMinute||0;
+ $('cm-effort').value=m.defaultEffort||m.effort||'medium';
+ for(const id of ['cm-id','cm-label','cm-deployment','cm-protocol','cm-context'])$(id).disabled=Boolean(m.builtin);
+ $('cm-save').textContent=m.builtin?'Save Azure model':'Update custom model';$('cm-cancel').hidden=false;
+ $('cm-maxout').focus();
+}
+let modelListSig='';
 function renderCustomModels(models){
- const custom=(models||[]).filter(m=>!m.builtin);
- $('custom-empty').hidden=custom.length>0;
+ const sig=JSON.stringify((models||[]).map(m=>[m.id,m.label,m.deployment,m.protocol,m.contextWindow,m.maxOutputTokens,m.tokensPerMinute,m.defaultEffort,m.effort]));
+ if(sig===modelListSig)return;
+ modelListSig=sig;
  const tbody=$('custom-models');
  tbody.replaceChildren();
- for(const m of custom){
+ for(const m of models||[]){
   const tr=document.createElement('tr');
-  for(const value of [m.id,m.label||m.id,m.deployment,{responses:'OpenAI',anthropic:'Anthropic',chat:'Chat completions','claude-cli':'Claude CLI'}[m.protocol]||m.protocol,(m.contextWindow||0).toLocaleString(),m.defaultEffort||'medium']){
+  for(const value of [m.id+(m.builtin?' · Azure':''),m.deployment,{responses:'OpenAI',anthropic:'Anthropic',chat:'Chat completions','claude-cli':'Claude CLI'}[m.protocol]||m.protocol,(m.contextWindow||0).toLocaleString(),(m.maxOutputTokens||128000).toLocaleString(),m.tokensPerMinute?m.tokensPerMinute.toLocaleString():'Off',m.defaultEffort||m.effort||'medium']){
    const td=document.createElement('td');
    td.textContent=value;
    tr.append(td);
@@ -175,21 +199,20 @@ function renderCustomModels(models){
   const eb=document.createElement('button');
   eb.className='mini';
   eb.textContent='Edit';
-  eb.addEventListener('click',()=>{
-   $('cm-id').value=m.id;$('cm-label').value=m.label||'';$('cm-deployment').value=m.deployment;
-   $('cm-protocol').value=m.protocol;$('cm-context').value=m.contextWindow||1000000;
-   $('cm-maxout').value=m.maxOutputTokens||128000;$('cm-effort').value=m.defaultEffort||'medium';
-  });
-  const rb=document.createElement('button');
-  rb.className='mini';
-  rb.textContent='Remove';
-  rb.addEventListener('click',async()=>{
-   if(!confirm(`Remove model “${m.id}”? Requests to it will fail closed.`))return;
-   try{const r=await window.azureBridge.models({action:'delete',id:m.id});$('cm-message').textContent=r.message;}
-   catch(err){$('cm-message').textContent=cleanIpcError(err,'azure:models');}
-   await refresh();
-  });
-  td.append(eb,rb);
+  eb.addEventListener('click',()=>editModel(m));
+  td.append(eb);
+  if(!m.builtin){
+   const rb=document.createElement('button');
+   rb.className='mini';
+   rb.textContent='Remove';
+   rb.addEventListener('click',async()=>{
+    if(!confirm(`Remove model “${m.id}”? Requests to it will fail closed.`))return;
+    try{const r=await window.azureBridge.models({action:'delete',id:m.id});$('cm-message').textContent=r.message;}
+    catch(err){$('cm-message').textContent=cleanIpcError(err,'azure:models');}
+    await refresh();
+   });
+   td.append(rb);
+  }
   tr.append(td);
   tbody.append(tr);
  }
@@ -224,9 +247,9 @@ $('cm-save').addEventListener('click',async()=>{
  const button=$('cm-save');
  button.disabled=true;
  try{
-  const r=await window.azureBridge.models({action:'save',model:{id:$('cm-id').value,label:$('cm-label').value,deployment:$('cm-deployment').value,protocol:$('cm-protocol').value,contextWindow:Number($('cm-context').value),maxOutputTokens:Number($('cm-maxout').value),defaultEffort:$('cm-effort').value}});
+  const r=await window.azureBridge.models({action:editingBuiltinId?'save-builtin':'save',model:{id:$('cm-id').value,label:$('cm-label').value,deployment:$('cm-deployment').value,protocol:$('cm-protocol').value,contextWindow:Number($('cm-context').value),maxOutputTokens:Number($('cm-maxout').value),tokensPerMinute:Number($('cm-tpm').value),defaultEffort:$('cm-effort').value}});
   $('cm-message').textContent=r.message;
-  $('cm-id').value='';$('cm-label').value='';$('cm-deployment').value='';
+  resetModelForm();
  }catch(err){
   $('cm-message').textContent=cleanIpcError(err,'azure:models');
  }finally{
@@ -234,6 +257,7 @@ $('cm-save').addEventListener('click',async()=>{
   await refresh();
  }
 });
+$('cm-cancel').addEventListener('click',resetModelForm);
 
 function toggleDetail(id){
  expandedId=expandedId===id?null:id;
@@ -595,11 +619,25 @@ function setToggleState({running,busy}){
  button.setAttribute('aria-label',`${label} bridge`);
 }
 
+function renderCodexSwitch(codex, models){
+ const button=$('codex-toggle');
+ const on=Boolean(codex?.enabled);
+ button.classList.toggle('is-on',on);
+ button.classList.toggle('is-busy',codexPending);
+ button.setAttribute('aria-checked',String(on));
+ button.disabled=codexPending||Boolean(codex?.error)||(Boolean(codex?.managed)&&!on);
+ button.querySelector('.toggle-label').textContent=codexPending?'Switching…':on?'On':'Off';
+ $('codex-mode').textContent=codex?.error?`Codex settings unavailable: ${codex.error}`:codex?.managed&&!on?'Codex settings changed outside the bridge; resolve the conflict before switching':on?'Using Azure Cursor Bridge':'Using your OpenAI models';
+ $('codex-model-list').textContent=`Bridge models: ${(models||[]).map(m=>m.label||m.id).join(' · ')}. Choose reasoning effort in Codex.`;
+}
+
 async function refresh(){
  try{
   const s=await window.azureBridge.snapshot();
   bridgeRunning=s.running;
   renderModelCards(s.models,s.settings);
+  renderCodexSwitch(s.codex,s.models);
+  if(!codexPending&&s.codexRestart?.startsWith('Codex restart failed:'))$('codex-message').textContent=s.codexRestart;
   if(s.claudeCli)$('claude-cli-status').textContent=s.claudeCli.installed?(s.claudeCli.loggedIn?'Installed · logged in':'Installed · NOT logged in — Claude CLI models will fail until you log in'):'Not installed';
   if(s.busy)$('status').textContent=s.busy==='restart'?'Restarting bridge…':s.busy==='stop'?'Stopping bridge…':'Starting bridge…';
   else $('status').textContent=s.running?'Bridge running':'Bridge stopped';
@@ -616,7 +654,7 @@ async function refresh(){
   renderPricingForm(lastModels,s.pricing);
   renderCustomModels(lastModels);
   renderPlayModels(lastModels);
-  if(s.pricingIsDefault&&!$('price-message').textContent)$('price-message').textContent='Prefilled with Azure list prices (Global Standard, Sep 2026) — verify against your agreement and save.';
+  if(s.pricingIsDefault&&!$('price-message').textContent)$('price-message').textContent='Prefilled with Azure short-context list prices (Global Standard, Sep 2026). Long-context requests can cost more; verify against your agreement before saving.';
   renderAzureKey(s.azureKey);
   maybeShowWizard(s.azureKey);
   docSnippets(s.baseUrl);
@@ -651,6 +689,18 @@ window.azureBridge.onLifecycleError(message=>{
 
 refresh();
 setInterval(refresh,2500);
+
+$('codex-toggle').addEventListener('click',async()=>{
+ const enabled=$('codex-toggle').getAttribute('aria-checked')!=='true';
+ if(!confirm(`Switch Codex to ${enabled?'the Azure Cursor Bridge':'your previous OpenAI setup'}? Codex will restart and any running tasks will stop.`))return;
+ codexPending=true;
+ $('codex-message').textContent='Saving Codex settings and restarting the desktop app…';
+ try{
+  const result=await window.azureBridge.codexSwitch(enabled);
+  $('codex-message').textContent=result.message;
+ }catch(error){$('codex-message').textContent=cleanIpcError(error,'azure:codex-switch');}
+ finally{codexPending=false;await refresh();}
+});
 
 $('price-save').addEventListener('click',async()=>{
  const button=$('price-save');
@@ -726,7 +776,7 @@ $('save-settings').addEventListener('click',async()=>{
    if(m.builtin){
     builtins[m.id]={effort:sel.value};
    }else if(sel.value!==(m.defaultEffort||'medium')){
-    await window.azureBridge.models({action:'save',model:{id:m.id,label:m.label,deployment:m.deployment,protocol:m.protocol,contextWindow:m.contextWindow,maxOutputTokens:m.maxOutputTokens,defaultEffort:sel.value}});
+    await window.azureBridge.models({action:'save',model:{id:m.id,label:m.label,deployment:m.deployment,protocol:m.protocol,contextWindow:m.contextWindow,maxOutputTokens:m.maxOutputTokens,tokensPerMinute:m.tokensPerMinute||0,defaultEffort:sel.value}});
    }
   }
   if(Object.keys(builtins).length)await window.azureBridge.saveSettings(builtins);

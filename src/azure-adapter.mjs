@@ -1,8 +1,10 @@
+import { createHash } from 'node:crypto';
 import { BridgeError } from './errors.mjs';
 import { resolveEffort, outputLimit } from './model-settings.mjs';
 
 export const MODELS = [
   { id: 'azure-astra', deployment: 'gpt-6-astra', label: 'Azure · GPT-6 Astra', protocol: 'responses' },
+  { id: 'azure-sol', deployment: 'gpt-6-sol', label: 'Azure · GPT-6 Sol', protocol: 'responses' },
   { id: 'azure-opus', deployment: 'claude-opus-5', label: 'Azure · Claude Opus 5', protocol: 'anthropic' },
 ];
 export function routeModel(id, models = MODELS) {
@@ -19,6 +21,19 @@ export function routeModel(id, models = MODELS) {
   return route;
 }
 const text = v => typeof v === 'string' ? v : JSON.stringify(v ?? '');
+// Cursor may extend tool IDs beyond Azure Responses' 64-character limit.
+// Hashing the same original ID for calls and results preserves their link.
+function azureCallId(id) {
+  if (typeof id !== 'string' || !id) throw new BridgeError('A tool call is missing its call_id', 400);
+  if (Buffer.byteLength(id, 'utf8') <= 64) return id;
+  return `call_${createHash('sha256').update(id).digest('hex').slice(0, 59)}`;
+}
+export function normalizeResponsesCallIds(input) {
+  if (!Array.isArray(input)) return input;
+  return input.map(item => item && ['function_call', 'function_call_output'].includes(item.type)
+    ? { ...item, call_id: azureCallId(item.call_id) }
+    : item);
+}
 function parts(content, assistant = false) {
   if (typeof content === 'string') return [{ type: assistant ? 'output_text' : 'input_text', text: content }];
   return (content || []).map(p => {
@@ -112,13 +127,14 @@ export async function runAzure({body,protocol,route,key,endpoint,signal,sink,pre
     // Routed targets have different output caps, so only forward limits and
     // effort the client explicitly asked for.
     const requestedLimit=body.max_output_tokens??body.max_completion_tokens??body.max_tokens;
-    if(requestedLimit)payload.max_completion_tokens=outputLimit(body,route);
+    if(requestedLimit!==undefined||route.maxOutputTokens<128000)payload.max_completion_tokens=outputLimit(body,route);
     if(route.effort??body.reasoning?.effort??body.reasoning_effort)payload.reasoning_effort=effort;
   }else{
     payload=route.protocol==='responses' ? (protocol==='chat'?chatToResponses(body):{...body,store:false}) : chatToAnthropic(protocol==='chat'?body:responsesToChat(body));
     payload.model=route.deployment;payload.stream=true;
     if(route.protocol==='anthropic'){payload.output_config={effort};payload.thinking={type:'adaptive'};payload.max_tokens=outputLimit(body,route);}
     if(route.protocol==='responses') {
+      payload.input=normalizeResponsesCallIds(payload.input);
       payload.max_output_tokens=outputLimit(body,route);
       payload.reasoning={effort};
       delete payload.previous_response_id;

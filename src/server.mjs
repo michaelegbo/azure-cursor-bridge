@@ -7,7 +7,8 @@ import { createSink, sendJson, sendOpenAIError } from './openai-protocol.mjs';
 import { BridgeError } from './errors.mjs';
 import { MODELS, routeModel, runAzure } from './azure-adapter.mjs';
 import { runClaudeCli } from './claude-cli-adapter.mjs';
-import { settings, LIMITS, EFFORTS, resolveEffort } from './model-settings.mjs';
+import { settings, EFFORTS, resolveEffort, outputLimit } from './model-settings.mjs';
+import { createRateLimiter } from './rate-limiter.mjs';
 import { openDb } from './db.mjs';
 
 function defaultStateDir() {
@@ -37,17 +38,19 @@ async function azureEndpoint() {
 // entries never shadow a built-in id or deployment name.
 const CUSTOM_ID = /^[a-z0-9][a-z0-9-]{1,39}$/;
 function registry() {
-  const builtins = MODELS.map(m => ({ ...m, ...LIMITS[m.id], builtin: true }));
+  const saved = settings(db.settingGet('model-settings') || {});
+  const builtins = MODELS.map(m => ({ ...m, ...saved[m.id], defaultEffort: saved[m.id].effort, builtin: true }));
   const taken = new Set(builtins.flatMap(m => [m.id, m.deployment]));
   let custom = [];
   try { custom = db.settingGet('custom-models') || []; } catch {}
   const extras = (Array.isArray(custom) ? custom : [])
     .filter(m => m && CUSTOM_ID.test(m.id || '') && m.deployment && ['responses', 'anthropic', 'chat', 'claude-cli'].includes(m.protocol) && !taken.has(m.id))
-    .map(m => ({ id: m.id, deployment: String(m.deployment), label: m.label || m.id, protocol: m.protocol, defaultEffort: m.defaultEffort, contextWindow: Number(m.contextWindow) || 1000000, maxInputTokens: m.maxInputTokens ? Number(m.maxInputTokens) : undefined, maxOutputTokens: Number(m.maxOutputTokens) || 128000 }));
+    .map(m => ({ id: m.id, deployment: String(m.deployment), label: m.label || m.id, protocol: m.protocol, defaultEffort: m.defaultEffort, contextWindow: Number(m.contextWindow) || 1000000, maxInputTokens: m.maxInputTokens ? Number(m.maxInputTokens) : undefined, maxOutputTokens: Number(m.maxOutputTokens) || 128000, tokensPerMinute: Number(m.tokensPerMinute) || 0 }));
   return [...builtins, ...extras];
 }
 
 const host = '127.0.0.1', port = Number(process.env.AZURE_BRIDGE_PORT || config.port || 17834);
+const rateLimiter = createRateLimiter();
 if (!process.env.AZURE_BRIDGE_PORT) await writeFile(path.join(stateDir, 'proxy.pid'), String(process.pid));
 
 function clientLabel(req) {
@@ -127,7 +130,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/health') return sendJson(res, 200, { status: 'ok', service: 'azure-cursor-bridge', modelCount: registry().length, version: '3.2.0' });
     const who = await auth(req);
     if (!who) throw new BridgeError('Invalid bridge API key', 401);
-    if (req.method === 'GET' && ['/v1/models', '/models'].includes(url.pathname)) return sendJson(res, 200, { object: 'list', data: registry().flatMap(m => [{ id: m.id, name: m.label }, ...EFFORTS.map(e => ({ id: `${m.id}-${e}`, name: `${m.label} · ${e}` }))].map(v => ({ id: v.id, object: 'model', created: 1789170000, owned_by: 'azure', name: v.name, context_window: m.contextWindow, max_input_tokens: m.maxInputTokens ?? m.contextWindow, max_output_tokens: m.maxOutputTokens || 128000, reasoning_efforts: EFFORTS }))) });
+    if (req.method === 'GET' && ['/v1/models', '/models'].includes(url.pathname)) return sendJson(res, 200, { object: 'list', data: registry().flatMap(m => [{ id: m.id, name: m.label }, ...EFFORTS.map(e => ({ id: `${m.id}-${e}`, name: `${m.label} · ${e}` }))].map(v => ({ id: v.id, object: 'model', created: 1789170000, owned_by: 'azure', name: v.name, context_window: m.contextWindow, max_input_tokens: m.maxInputTokens ?? m.contextWindow, max_output_tokens: m.maxOutputTokens || 128000, tokens_per_minute: m.tokensPerMinute || 0, reasoning_efforts: EFFORTS }))) });
     if (req.method !== 'POST' || !['/v1/chat/completions', '/chat/completions', '/v1/responses', '/responses'].includes(url.pathname)) throw new BridgeError('Not found', 404);
     let bytes = 0; const chunks = []; for await (const chunk of req) { bytes += chunk.length; if (bytes > 32 * 1024 * 1024) throw new BridgeError('Request too large', 413); chunks.push(chunk); }
     let body; try { body = JSON.parse(Buffer.concat(chunks)); } catch { throw new BridgeError('Invalid JSON', 400); }
@@ -141,6 +144,7 @@ const server = http.createServer(async (req, res) => {
     if (protocol === 'chat' && !Array.isArray(body.messages)) throw new BridgeError('messages must be an array', 400);
     let preferences; try { preferences = settings(db.settingGet('model-settings') || {}); } catch { preferences = settings(); }
     const effort = resolveEffort(body, route, preferences);
+    if (route.protocol !== 'claude-cli') rateLimiter.take(route.deployment, route.tokensPerMinute, Math.ceil(bytes / 4) + outputLimit(body, route));
     entry = { effort, contextWindow: route.contextWindow, id: randomUUID(), at: new Date().toISOString(), model: route.id, deployment: route.deployment, protocol, bytes, status: 'running', client: clientLabel(req), via: req.headers['cf-connecting-ip'] ? 'public' : 'local', key: who.label };
     const started = Date.now();
     db.upsertRequest(entry);
