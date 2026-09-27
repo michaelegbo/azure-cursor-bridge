@@ -12,12 +12,19 @@ const cleanIpcError=(err,method)=>String(err?.message||err).replace(new RegExp(`
 let pricingCfg=null;
 let pricingLoaded=false;
 
-function costOf(model,u){
+function tokenCost(p,input,cached,output){
+ const fresh=Math.max(0,input-cached);
+ return fresh*(p.input||0)/1e6+cached*(p.cachedInput||0)/1e6+output*(p.output||0)/1e6;
+}
+// Tokens Azure served on the fast (priority) tier cost fastMultiplier x the
+// standard rate: a single request served fast, or the fast_* share of totals.
+function costOf(model,u,tierServed){
  const p=pricingCfg?.[model];
  if(!p||!u)return null;
  if(!(p.input>0||p.cachedInput>0||p.output>0))return null;
- const fresh=Math.max(0,(u.inputTokens||0)-(u.cachedTokens||0));
- return fresh*(p.input||0)/1e6+(u.cachedTokens||0)*(p.cachedInput||0)/1e6+(u.outputTokens||0)*(p.output||0)/1e6;
+ const base=tokenCost(p,u.inputTokens||0,u.cachedTokens||0,u.outputTokens||0);
+ const fast=tierServed==='priority'?base:tokenCost(p,u.fastInputTokens||0,u.fastCachedTokens||0,u.fastOutputTokens||0);
+ return base+fast*((p.fastMultiplier??2)-1);
 }
 
 function fmtCost(c){
@@ -29,7 +36,7 @@ function fmtCost(c){
 function tokensCell(r){
  if(!r.usage)return '—';
  const cached=r.usage.cachedTokens?` (${r.usage.cachedTokens.toLocaleString()})`:'';
- const cost=costOf(r.model,r.usage);
+ const cost=costOf(r.model,r.usage,r.tierServed);
  return `${(r.usage.inputTokens||0).toLocaleString()}${cached} / ${(r.usage.outputTokens||0).toLocaleString()}`+(cost===null?'':` · ~${fmtCost(cost)}`);
 }
 
@@ -198,7 +205,7 @@ function renderUsageDays(days){
 let lastModels=[];
 let modelCardsSig='';
 function renderModelCards(models,modelSettings){
- const sig=JSON.stringify((models||[]).map(m=>[m.id,m.contextWindow,m.maxInputTokens,m.maxOutputTokens,m.tokensPerMinute,m.defaultEffort,modelSettings?.[m.id]?.effort]));
+ const sig=JSON.stringify((models||[]).map(m=>[m.id,m.contextWindow,m.maxInputTokens,m.maxOutputTokens,m.tokensPerMinute,m.defaultEffort,modelSettings?.[m.id]?.effort,m.fast,m.fastSupported]));
  if(sig===modelCardsSig)return;
  modelCardsSig=sig;
  const grid=$('model-cards');
@@ -230,13 +237,29 @@ function renderModelCards(models,modelSettings){
   out.textContent=`Output allowance: up to ${(m.maxOutputTokens||128000).toLocaleString()} tokens`;
   const tpm=document.createElement('p');
   tpm.textContent=`Local TPM budget: ${m.tokensPerMinute?m.tokensPerMinute.toLocaleString():'Off'}`;
-  card.append(name,idCode,dep,label,sel,ctx,out,tpm);
+  let fast;
+  if(m.fastSupported){
+   fast=document.createElement('label');
+   fast.className='fast-toggle';
+   const cb=document.createElement('input');
+   cb.type='checkbox';
+   cb.id=`fast-${m.id}`;
+   cb.checked=m.fast===true;
+   const text=document.createElement('span');
+   text.textContent='Fast mode — Azure priority processing: faster responses, billed at the fast-mode rate';
+   fast.append(cb,text);
+  }else{
+   fast=document.createElement('p');
+   fast.className='fast-note';
+   fast.textContent=m.protocol==='claude-cli'||m.protocol==='anthropic'?'Fast mode: not available for this model through the bridge':'Fast mode: Azure does not offer priority processing for this model yet';
+  }
+  card.append(name,idCode,dep,label,sel,fast,ctx,out,tpm);
   grid.append(card);
  }
 }
 let pricingModelsSig='';
 function renderPricingForm(models,pricing){
- const sig=(models||[]).map(m=>m.id).join(',');
+ const sig=(models||[]).map(m=>m.id+(m.fastSupported?'*':'')).join(',');
  if(sig===pricingModelsSig)return;
  pricingModelsSig=sig;
  const grid=$('pricing-grid');
@@ -255,6 +278,18 @@ function renderPricingForm(models,pricing){
    input.id=`price-${m.id}-${field}`;
    const v=pricing?.[m.id]?.[field];
    if(v!==undefined&&v!==null)input.value=v;
+   label.append(input);
+   row.append(label);
+  }
+  if(m.fastSupported){
+   row.classList.add('has-fast');
+   const label=document.createElement('label');
+   label.textContent='Fast mode ×';
+   label.title='Rate multiplier applied to tokens Azure served in fast mode (priority processing). OpenAI bills fast mode at 2×; check your Azure rate card.';
+   const input=document.createElement('input');
+   input.type='number';input.min='1';input.max='10';input.step='0.1';
+   input.id=`price-${m.id}-fastMultiplier`;
+   input.value=pricing?.[m.id]?.fastMultiplier??2;
    label.append(input);
    row.append(label);
   }
@@ -387,7 +422,7 @@ function buildDetailRow(id){
  const u=d.result?.usage;
  if(u){
   const fresh=Math.max(0,(u.inputTokens||0)-(u.cachedTokens||0));
-  const cost=costOf(d.model,u);
+  const cost=costOf(d.model,u,d.result?.tierServed);
   const um=document.createElement('p');
   um.textContent=`Exact usage: ${(u.inputTokens||0).toLocaleString()} tokens in — ${(u.cachedTokens||0).toLocaleString()} served from Azure's prompt cache, ${fresh.toLocaleString()} fresh — ${(u.outputTokens||0).toLocaleString()} out.`+(cost===null?'':` Estimated cost: ${fmtCost(cost)} at your saved rates.`);
   wrap.append(um);
@@ -690,7 +725,9 @@ function renderRequests(requests){
   const source=(r.client?`${r.client} · ${r.via==='public'?'public':'local'}`:'—')+(r.key&&r.key!=='Owner'?` · key: ${r.key}`:'');
   const waited=r.queueMs>=1000?` · waited ${fmtWait(r.queueMs)} in queue`:'';
   const jumped=r.queueJumped>0?' · went ahead of a larger request':'';
-  for(const value of [new Date(r.at).toLocaleTimeString(),source,r.model+' / '+(r.effort||'default'),(r.error||r.status)+waited+jumped,tokensCell(r)]){
+  // Azure may downgrade fast requests to standard (ramp limits, peak load).
+  const tier=r.tierServed==='priority'?' · ⚡ fast':r.tierRequested==='priority'?(r.tierServed?' · fast requested, Azure served standard':' · ⚡ fast requested'):'';
+  for(const value of [new Date(r.at).toLocaleTimeString(),source,r.model+' / '+(r.effort||'default'),(r.error||r.status)+tier+waited+jumped,tokensCell(r)]){
    const td=document.createElement('td');
    td.textContent=value;
    tr.append(td);
@@ -817,6 +854,8 @@ $('price-save').addEventListener('click',async()=>{
     const el=$(`price-${m.id}-${f}`);
     payload[m.id][f]=el&&el.value!==''?Number(el.value):0;
    }
+   const fm=$(`price-${m.id}-fastMultiplier`);
+   if(fm&&fm.value!=='')payload[m.id].fastMultiplier=Number(fm.value);
   }
   pricingCfg=await window.azureBridge.savePricing(payload);
   $('price-message').textContent='Rates saved — estimates update immediately.';
@@ -877,10 +916,12 @@ $('save-settings').addEventListener('click',async()=>{
   for(const m of lastModels){
    const sel=$(`effort-${m.id}`);
    if(!sel)continue;
+   const fastCb=$(`fast-${m.id}`);
+   const fast=fastCb?fastCb.checked:m.fast===true;
    if(m.builtin){
-    builtins[m.id]={effort:sel.value};
-   }else if(sel.value!==(m.defaultEffort||'medium')){
-    await window.azureBridge.models({action:'save',model:{id:m.id,label:m.label,deployment:m.deployment,protocol:m.protocol,contextWindow:m.contextWindow,maxOutputTokens:m.maxOutputTokens,tokensPerMinute:m.tokensPerMinute||0,defaultEffort:sel.value}});
+    builtins[m.id]={effort:sel.value,...(fastCb?{fast}:{})};
+   }else if(sel.value!==(m.defaultEffort||'medium')||fast!==(m.fast===true)){
+    await window.azureBridge.models({action:'save',model:{id:m.id,label:m.label,deployment:m.deployment,protocol:m.protocol,contextWindow:m.contextWindow,maxOutputTokens:m.maxOutputTokens,tokensPerMinute:m.tokensPerMinute||0,defaultEffort:sel.value,fast}});
    }
   }
   if(Object.keys(builtins).length)await window.azureBridge.saveSettings(builtins);

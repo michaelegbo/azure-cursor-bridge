@@ -156,6 +156,21 @@ test('settling with the real prompt size returns an over-estimate to the budget'
   assert.equal(second.done, true, '800 tokens refunded made room');
 });
 
+test('a finished request is charged its real usage, returning the unused output reservation', async () => {
+  const c = fakeClock();
+  const q = createTpmQueue(c);
+  // 300 input estimate + 1,500 max-output reservation = 1,800 of 2,000.
+  const first = req(q, 1800, { estimatedInputTokens: 300 });
+  await c.flush();
+  const second = req(q, 1500);
+  await c.flush();
+  assert.equal(second.done, false);
+  first.ticket.settle({ inputTokens: 250, outputTokens: 50 });
+  await c.flush();
+  assert.equal(second.done, true, 'only 300 tokens were really used, so 1,500 fit again');
+  assert.equal(q.snapshot()[0].available, 200);
+});
+
 test('turning a budget off releases everything still waiting', async () => {
   const c = fakeClock();
   const q = createTpmQueue(c);

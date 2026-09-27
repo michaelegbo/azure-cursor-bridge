@@ -37,6 +37,17 @@ export function openDb(stateDir) {
   try { db.exec(`ALTER TABLE guest_keys ADD COLUMN history TEXT`); } catch {}
   try { db.exec(`ALTER TABLE requests ADD COLUMN queue_ms INTEGER`); } catch {}
   try { db.exec(`ALTER TABLE requests ADD COLUMN queue_jumped INTEGER`); } catch {}
+  try { db.exec(`ALTER TABLE requests ADD COLUMN tier_requested TEXT`); } catch {}
+  try { db.exec(`ALTER TABLE requests ADD COLUMN tier_served TEXT`); } catch {}
+  for (const col of ['fast_input_tokens', 'fast_cached_tokens', 'fast_output_tokens']) {
+    try { db.exec(`ALTER TABLE usage_daily ADD COLUMN ${col} INTEGER DEFAULT 0`); } catch {}
+  }
+  const usageRow = r => ({
+    requests: r.requests || 0, inputTokens: r.input_tokens || 0,
+    cachedTokens: r.cached_tokens || 0, outputTokens: r.output_tokens || 0,
+    fastInputTokens: r.fast_input_tokens || 0, fastCachedTokens: r.fast_cached_tokens || 0,
+    fastOutputTokens: r.fast_output_tokens || 0,
+  });
 
   const requestToRow = r => ({
     id: r.id, at: r.at, model: r.model ?? null, deployment: r.deployment ?? null,
@@ -47,6 +58,7 @@ export function openDb(stateDir) {
     output_tokens: r.usage?.outputTokens ?? null, error: r.error ?? null,
     context_window: r.contextWindow ?? null,
     queue_ms: r.queueMs ?? null, queue_jumped: r.queueJumped ?? null,
+    tier_requested: r.tierRequested ?? null, tier_served: r.tierServed ?? null,
   });
   const rowToRequest = row => ({
     id: row.id, at: row.at, model: row.model, deployment: row.deployment,
@@ -54,6 +66,7 @@ export function openDb(stateDir) {
     client: row.client, via: row.via, key: row.key_label, durationMs: row.duration_ms,
     error: row.error, contextWindow: row.context_window,
     queueMs: row.queue_ms ?? null, queueJumped: row.queue_jumped ?? null,
+    tierRequested: row.tier_requested ?? null, tierServed: row.tier_served ?? null,
     usage: row.input_tokens === null && row.output_tokens === null ? null : {
       inputTokens: row.input_tokens || 0, cachedTokens: row.cached_tokens || 0,
       outputTokens: row.output_tokens || 0,
@@ -63,9 +76,9 @@ export function openDb(stateDir) {
   const api = {
     upsertRequest(entry) {
       const r = requestToRow(entry);
-      db.prepare(`INSERT INTO requests(id,at,model,deployment,protocol,effort,bytes,status,client,via,key_label,duration_ms,input_tokens,cached_tokens,output_tokens,error,context_window,queue_ms,queue_jumped)
-        VALUES(:id,:at,:model,:deployment,:protocol,:effort,:bytes,:status,:client,:via,:key_label,:duration_ms,:input_tokens,:cached_tokens,:output_tokens,:error,:context_window,:queue_ms,:queue_jumped)
-        ON CONFLICT(id) DO UPDATE SET status=:status,duration_ms=:duration_ms,input_tokens=:input_tokens,cached_tokens=:cached_tokens,output_tokens=:output_tokens,error=:error,queue_ms=:queue_ms,queue_jumped=:queue_jumped`).run(r);
+      db.prepare(`INSERT INTO requests(id,at,model,deployment,protocol,effort,bytes,status,client,via,key_label,duration_ms,input_tokens,cached_tokens,output_tokens,error,context_window,queue_ms,queue_jumped,tier_requested,tier_served)
+        VALUES(:id,:at,:model,:deployment,:protocol,:effort,:bytes,:status,:client,:via,:key_label,:duration_ms,:input_tokens,:cached_tokens,:output_tokens,:error,:context_window,:queue_ms,:queue_jumped,:tier_requested,:tier_served)
+        ON CONFLICT(id) DO UPDATE SET status=:status,duration_ms=:duration_ms,input_tokens=:input_tokens,cached_tokens=:cached_tokens,output_tokens=:output_tokens,error=:error,queue_ms=:queue_ms,queue_jumped=:queue_jumped,tier_served=:tier_served`).run(r);
       db.prepare(`DELETE FROM requests WHERE id NOT IN (SELECT id FROM requests ORDER BY at DESC LIMIT 500)`).run();
     },
     listRequests(limit = 100) {
@@ -109,25 +122,27 @@ export function openDb(stateDir) {
         ON CONFLICT(day,model) DO UPDATE SET requests=excluded.requests,input_tokens=excluded.input_tokens,cached_tokens=excluded.cached_tokens,output_tokens=excluded.output_tokens`)
         .run(day, model, u.requests || 0, u.inputTokens || 0, u.cachedTokens || 0, u.outputTokens || 0);
     },
-    usageAdd(model, usage) {
+    // Tokens served by Azure's priority (fast) tier are also counted in the
+    // fast_* columns so cost estimates can apply the fast-mode rate to them.
+    usageAdd(model, usage, tierServed = null) {
       const day = new Date().toISOString().slice(0, 10);
-      db.prepare(`INSERT INTO usage_daily(day,model,requests,input_tokens,cached_tokens,output_tokens) VALUES(?,?,1,?,?,?)
-        ON CONFLICT(day,model) DO UPDATE SET requests=requests+1,input_tokens=input_tokens+excluded.input_tokens,cached_tokens=cached_tokens+excluded.cached_tokens,output_tokens=output_tokens+excluded.output_tokens`)
-        .run(day, model, usage.inputTokens || 0, usage.cachedTokens || 0, usage.outputTokens || 0);
+      const fast = tierServed === 'priority';
+      db.prepare(`INSERT INTO usage_daily(day,model,requests,input_tokens,cached_tokens,output_tokens,fast_input_tokens,fast_cached_tokens,fast_output_tokens) VALUES(?,?,1,?,?,?,?,?,?)
+        ON CONFLICT(day,model) DO UPDATE SET requests=requests+1,input_tokens=input_tokens+excluded.input_tokens,cached_tokens=cached_tokens+excluded.cached_tokens,output_tokens=output_tokens+excluded.output_tokens,fast_input_tokens=fast_input_tokens+excluded.fast_input_tokens,fast_cached_tokens=fast_cached_tokens+excluded.fast_cached_tokens,fast_output_tokens=fast_output_tokens+excluded.fast_output_tokens`)
+        .run(day, model, usage.inputTokens || 0, usage.cachedTokens || 0, usage.outputTokens || 0,
+          fast ? usage.inputTokens || 0 : 0, fast ? usage.cachedTokens || 0 : 0, fast ? usage.outputTokens || 0 : 0);
     },
     usageAggregate(daysBack) {
       let rows;
+      const cols = `model,SUM(requests) requests,SUM(input_tokens) input_tokens,SUM(cached_tokens) cached_tokens,SUM(output_tokens) output_tokens,SUM(fast_input_tokens) fast_input_tokens,SUM(fast_cached_tokens) fast_cached_tokens,SUM(fast_output_tokens) fast_output_tokens`;
       if (daysBack === null) {
-        rows = db.prepare(`SELECT model,SUM(requests) requests,SUM(input_tokens) input_tokens,SUM(cached_tokens) cached_tokens,SUM(output_tokens) output_tokens FROM usage_daily GROUP BY model`).all();
+        rows = db.prepare(`SELECT ${cols} FROM usage_daily GROUP BY model`).all();
       } else {
         const cutoff = new Date(Date.now() - (daysBack - 1) * 86400000).toISOString().slice(0, 10);
-        rows = db.prepare(`SELECT model,SUM(requests) requests,SUM(input_tokens) input_tokens,SUM(cached_tokens) cached_tokens,SUM(output_tokens) output_tokens FROM usage_daily WHERE day>=? GROUP BY model`).all(cutoff);
+        rows = db.prepare(`SELECT ${cols} FROM usage_daily WHERE day>=? GROUP BY model`).all(cutoff);
       }
       const res = {};
-      for (const r of rows) res[r.model] = {
-        requests: r.requests || 0, inputTokens: r.input_tokens || 0,
-        cachedTokens: r.cached_tokens || 0, outputTokens: r.output_tokens || 0,
-      };
+      for (const r of rows) res[r.model] = usageRow(r);
       return res;
     },
     queueRecord(model, ticket) {
@@ -155,10 +170,7 @@ export function openDb(stateDir) {
       const byDay = new Map();
       for (const r of rows) {
         if (!byDay.has(r.day)) byDay.set(r.day, { day: r.day, models: {} });
-        byDay.get(r.day).models[r.model] = {
-          requests: r.requests || 0, inputTokens: r.input_tokens || 0,
-          cachedTokens: r.cached_tokens || 0, outputTokens: r.output_tokens || 0,
-        };
+        byDay.get(r.day).models[r.model] = usageRow(r);
       }
       return [...byDay.values()];
     },

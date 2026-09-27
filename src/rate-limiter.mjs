@@ -25,13 +25,16 @@ export function createTpmQueue({ now = () => Date.now(), agingMs = 10000, setTim
     let settled = false;
     return {
       deployment, tokens: w.tokens, waitedMs, queued: waitedMs > 0, jumpedAhead: jumped,
-      // Replace the input estimate with the real prompt size once known. The
-      // output reservation stays, matching how Azure counts max output tokens.
-      settle(actualInputTokens) {
-        if (settled || !s || !(s.limit > 0) || !(actualInputTokens > 0)) return;
+      // Once the request finishes, charge what it really used (input plus
+      // output) and return the rest of the reservation. Holding the full max
+      // output reservation measured stricter than Azure's own limiter (long
+      // queue waits with zero Azure 429s); Azure 429s still pause the queue.
+      settle(actual) {
+        const used = typeof actual === 'number' ? actual + (w.tokens - w.estimatedInputTokens) : (actual?.inputTokens || 0) + (actual?.outputTokens || 0);
+        if (settled || !s || !(s.limit > 0) || !(used > 0)) return;
         settled = true;
         refill(s, now());
-        s.available = Math.min(s.limit, s.available + (w.estimatedInputTokens - actualInputTokens));
+        s.available = Math.min(s.limit, s.available + (w.tokens - used));
         pump(s);
       },
     };

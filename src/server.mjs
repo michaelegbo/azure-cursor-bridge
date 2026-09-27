@@ -7,7 +7,7 @@ import { createSink, sendJson, sendOpenAIError, openSse } from './openai-protoco
 import { BridgeError } from './errors.mjs';
 import { MODELS, routeModel, runAzure } from './azure-adapter.mjs';
 import { runClaudeCli } from './claude-cli-adapter.mjs';
-import { settings, EFFORTS, resolveEffort, outputLimit } from './model-settings.mjs';
+import { settings, EFFORTS, resolveEffort, outputLimit, resolveServiceTier } from './model-settings.mjs';
 import { createTpmQueue } from './rate-limiter.mjs';
 import { openDb } from './db.mjs';
 
@@ -45,7 +45,7 @@ function registry() {
   try { custom = db.settingGet('custom-models') || []; } catch {}
   const extras = (Array.isArray(custom) ? custom : [])
     .filter(m => m && CUSTOM_ID.test(m.id || '') && m.deployment && ['responses', 'anthropic', 'chat', 'claude-cli'].includes(m.protocol) && !taken.has(m.id))
-    .map(m => ({ id: m.id, deployment: String(m.deployment), label: m.label || m.id, protocol: m.protocol, defaultEffort: m.defaultEffort, contextWindow: Number(m.contextWindow) || 1000000, maxInputTokens: m.maxInputTokens ? Number(m.maxInputTokens) : undefined, maxOutputTokens: Number(m.maxOutputTokens) || 128000, tokensPerMinute: Number(m.tokensPerMinute) || 0 }));
+    .map(m => ({ id: m.id, deployment: String(m.deployment), label: m.label || m.id, protocol: m.protocol, defaultEffort: m.defaultEffort, contextWindow: Number(m.contextWindow) || 1000000, maxInputTokens: m.maxInputTokens ? Number(m.maxInputTokens) : undefined, maxOutputTokens: Number(m.maxOutputTokens) || 128000, tokensPerMinute: Number(m.tokensPerMinute) || 0, fast: m.fast === true, fastSupported: ['responses', 'chat'].includes(m.protocol) }));
   return [...builtins, ...extras];
 }
 
@@ -153,8 +153,9 @@ const server = http.createServer(async (req, res) => {
     if (protocol === 'chat' && !Array.isArray(body.messages)) throw new BridgeError('messages must be an array', 400);
     let preferences; try { preferences = settings(db.settingGet('model-settings') || {}); } catch { preferences = settings(); }
     const effort = resolveEffort(body, route, preferences);
+    const serviceTier = ['responses', 'chat'].includes(route.protocol) ? resolveServiceTier(body, route, preferences) : null;
     const estimatedInputTokens = Math.ceil(bytes / 4);
-    entry = { effort, contextWindow: route.contextWindow, id: randomUUID(), at: new Date().toISOString(), model: route.id, deployment: route.deployment, protocol, bytes, status: 'running', client: clientLabel(req), via: req.headers['cf-connecting-ip'] ? 'public' : 'local', key: who.label };
+    entry = { effort, contextWindow: route.contextWindow, id: randomUUID(), at: new Date().toISOString(), model: route.id, deployment: route.deployment, protocol, bytes, status: 'running', client: clientLabel(req), via: req.headers['cf-connecting-ip'] ? 'public' : 'local', key: who.label, tierRequested: serviceTier };
     let started = Date.now();
     let ticket = null;
     db.upsertRequest(entry);
@@ -162,7 +163,8 @@ const server = http.createServer(async (req, res) => {
     const abort = new AbortController(); res.on('close', () => { if (!res.writableEnded) abort.abort(); });
     sink = createSink(protocol, res, { stream: Boolean(body.stream), onLifecycle: ({ status, error }) => {
       entry.status = status; entry.durationMs = Date.now() - started; entry.usage = sink.session?.usage;
-      if (entry.usage && status !== 'running' && !countedEntries.has(entry)) { countedEntries.add(entry); try { db.usageAdd(entry.model, entry.usage); } catch {} ticket?.settle(entry.usage.inputTokens); }
+      if (sink.session?.serviceTier) entry.tierServed = sink.session.serviceTier;
+      if (entry.usage && status !== 'running' && !countedEntries.has(entry)) { countedEntries.add(entry); try { db.usageAdd(entry.model, entry.usage, entry.tierServed); } catch {} ticket?.settle(entry.usage); }
       if (error) entry.error = String(error.message).replaceAll(key, '[redacted]').slice(0, 500);
       try { db.upsertRequest(entry); } catch {}
     } });
@@ -190,7 +192,7 @@ const server = http.createServer(async (req, res) => {
       try { db.upsertRequest(entry); } catch {}
       const onThrottle = ms => { tpmQueue.pause(route.deployment, ms); if (route.tokensPerMinute > 0) { try { db.queueThrottle(route.id); } catch {} } };
       if (route.protocol === 'claude-cli') await runClaudeCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir });
-      else await runAzure({ body, protocol, route, key, endpoint, signal: abort.signal, sink, preferences, onThrottle });
+      else await runAzure({ body, protocol, route, key, endpoint, signal: abort.signal, sink, preferences, onThrottle, serviceTier });
     } finally { clearInterval(heartbeat); clearTimeout(holdOpen); }
   } catch (error) {
     if (entry) { entry.status = 'failed'; entry.error = String(error.message).replaceAll(key || ' ', '[redacted]').slice(0, 500); try { db.upsertRequest(entry); } catch {} }

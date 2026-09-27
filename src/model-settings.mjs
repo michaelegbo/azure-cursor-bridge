@@ -1,5 +1,8 @@
 import { BridgeError } from './errors.mjs';
 export const EFFORTS=['low','medium','high','xhigh','max'];
+// Azure "priority processing" (OpenAI's "fast mode"). As of Sept 2026 Azure
+// offers it for gpt-6-sol (Global/US Data Zone standard) but not gpt-6-astra.
+export const FAST_SUPPORTED=new Set(['azure-sol']);
 export const LIMITS={'azure-astra':{contextWindow:1050000,maxInputTokens:922000,maxOutputTokens:128000,tokensPerMinute:2000000},'azure-sol':{contextWindow:1050000,maxInputTokens:922000,maxOutputTokens:128000,tokensPerMinute:2000000},'azure-opus':{contextWindow:1000000,maxOutputTokens:128000,tokensPerMinute:0}};
 export function settings(value={}) {
   const result={};
@@ -14,9 +17,22 @@ export function settings(value={}) {
       throw new BridgeError(`${id} max output must be between 256 and ${limits.maxOutputTokens.toLocaleString()} tokens`,400);
     if(!Number.isInteger(tokensPerMinute)||(tokensPerMinute!==0&&tokensPerMinute<1000)||tokensPerMinute>100000000)
       throw new BridgeError(`${id} tokens per minute must be 0 (off) or between 1,000 and 100,000,000`,400);
-    result[id]={effort,contextWindow,...(limits.maxInputTokens?{maxInputTokens:limits.maxInputTokens}:{}),maxOutputTokens,tokensPerMinute};
+    const fast=FAST_SUPPORTED.has(id)&&chosen.fast===true;
+    result[id]={effort,contextWindow,...(limits.maxInputTokens?{maxInputTokens:limits.maxInputTokens}:{}),maxOutputTokens,tokensPerMinute,fast};
   }
   return result;
+}
+// Azure service tier for a request, or null to leave it to the deployment.
+// Precedence: the client's own service_tier (Codex's fast toggle) wins over
+// the app setting. 'fast' is OpenAI's name; Azure only accepts 'priority'.
+// 'flex' and 'auto' are dropped: Azure rejects flex for these models.
+export function resolveServiceTier(body,route,prefs={}){
+  const supported=route.fastSupported??FAST_SUPPORTED.has(route.id);
+  const requested=typeof body.service_tier==='string'?body.service_tier.toLowerCase():null;
+  if(requested==='fast'||requested==='priority')return supported?'priority':null;
+  if(requested==='default')return 'default';
+  const enabled=route.fast??settings(prefs)[route.id]?.fast;
+  return supported&&enabled?'priority':null;
 }
 export function resolveEffort(body,route,prefs={}) {const effort=route.effort??body.reasoning?.effort??body.reasoning_effort??body.output_config?.effort??settings(prefs)[route.id]?.effort??route.defaultEffort??'medium';if(!EFFORTS.includes(effort))throw new BridgeError('Choose low, medium, high, xhigh, or max reasoning effort',400);return effort;}
 export function outputLimit(body,route){const n=body.max_output_tokens??body.max_completion_tokens??body.max_tokens??route.maxOutputTokens??128000;if(!Number.isInteger(n)||n<1||n>128000)throw new BridgeError('Output limit must be between 1 and 128000 tokens',400);return Math.min(n,route.maxOutputTokens??128000);}

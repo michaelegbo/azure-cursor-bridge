@@ -21,7 +21,7 @@ function defaultStateDir() {
 const state = defaultStateDir();
 await mkdir(state, { recursive: true });
 const codexSwitch = createCodexSwitch({ stateDir: state, assetsDir: here });
-const { settings, EFFORTS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/model-settings.mjs')).href);
+const { settings, EFFORTS, FAST_SUPPORTED } = await import(pathToFileURL(path.join(bridgeRoot, 'src/model-settings.mjs')).href);
 const { MODELS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/azure-adapter.mjs')).href);
 const { openDb } = await import(pathToFileURL(path.join(bridgeRoot, 'src/db.mjs')).href);
 
@@ -101,7 +101,9 @@ function queueLifecycle(action) {
 // Shown as editable defaults; the user's own agreement/region rates override.
 const DEFAULT_PRICING = {
   'azure-astra': { input: 10, cachedInput: 1, output: 50 },
-  'azure-sol': { input: 2, cachedInput: 0.2, output: 10 },
+  // Fast mode: OpenAI bills it at 2x; Azure's priority rate isn't published
+  // per model, so the multiplier is an editable estimate.
+  'azure-sol': { input: 2, cachedInput: 0.2, output: 10, fastMultiplier: 2 },
   'azure-opus': { input: 5, cachedInput: 0.5, output: 25 },
 };
 const maskKey = v => v ? `${v.slice(0, 8)}…${v.slice(-4)}` : '';
@@ -116,10 +118,10 @@ const CUSTOM_MODEL_ID = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/;
 function modelRegistry() {
   const saved = settings(db.settingGet('model-settings') || {});
-  const builtins = MODELS.map(m => ({ ...m, ...saved[m.id], defaultEffort: saved[m.id].effort, builtin: true }));
+  const builtins = MODELS.map(m => ({ ...m, ...saved[m.id], defaultEffort: saved[m.id].effort, builtin: true, fastSupported: FAST_SUPPORTED.has(m.id) }));
   const taken = new Set(builtins.flatMap(m => [m.id, m.deployment]));
   const custom = (db.settingGet('custom-models') || []).filter(m => m && !taken.has(m.id));
-  return [...builtins, ...custom.map(m => ({ ...m, builtin: false }))];
+  return [...builtins, ...custom.map(m => ({ ...m, builtin: false, fast: m.fast === true, fastSupported: ['responses', 'chat'].includes(m.protocol) }))];
 }
 ipcMain.handle('azure:models', async (_e, cmd) => {
   const action = cmd?.action;
@@ -129,6 +131,7 @@ ipcMain.handle('azure:models', async (_e, cmd) => {
     if (!MODELS.some(m => m.id === id)) throw Error('Built-in model not found');
     const current = db.settingGet('model-settings') || {};
     const validated = settings({ ...current, [id]: {
+      ...(current[id] || {}),
       effort: cmd.model.defaultEffort,
       maxOutputTokens: cmd.model.maxOutputTokens,
       tokensPerMinute: cmd.model.tokensPerMinute,
@@ -159,7 +162,9 @@ ipcMain.handle('azure:models', async (_e, cmd) => {
     const tokensPerMinute = Number(cmd.model?.tokensPerMinute ?? 0);
     if (!Number.isInteger(tokensPerMinute) || (tokensPerMinute !== 0 && tokensPerMinute < 1000) || tokensPerMinute > 100000000) throw Error('Tokens per minute must be 0 (off) or between 1,000 and 100,000,000');
     const defaultEffort = EFFORTS.includes(cmd.model?.defaultEffort) ? cmd.model.defaultEffort : 'medium';
-    const entry = { id, deployment, label: String(cmd.model?.label || '').trim().slice(0, 60) || id, protocol, contextWindow, maxOutputTokens, tokensPerMinute, defaultEffort };
+    const prior = custom.find(m => m.id === id);
+    const fast = ['responses', 'chat'].includes(protocol) && (cmd.model?.fast ?? prior?.fast) === true;
+    const entry = { id, deployment, label: String(cmd.model?.label || '').trim().slice(0, 60) || id, protocol, contextWindow, maxOutputTokens, tokensPerMinute, defaultEffort, fast };
     const existing = custom.findIndex(m => m.id === id);
     if (existing >= 0) custom[existing] = entry; else custom.push(entry);
     db.settingSet('custom-models', custom);
@@ -260,7 +265,15 @@ ipcMain.handle('azure:codex-switch', async (_e, enabled) => {
   return { enabled, message: `Codex will restart now. ${enabled ? 'Bridge models' : 'Your previous OpenAI models'} will be available when it reopens.${switchNote ? ` ${switchNote}` : ''}` };
 });
 
-ipcMain.handle('azure:settings', async (_e, value) => { const validated = settings({ ...(db.settingGet('model-settings') || {}), ...value }); db.settingSet('model-settings', validated); return validated; });
+// Merge per model so saving one field (effort, fast) never resets the others.
+ipcMain.handle('azure:settings', async (_e, value) => {
+  const current = db.settingGet('model-settings') || {};
+  const merged = { ...current };
+  for (const [id, v] of Object.entries(value || {})) merged[id] = { ...(current[id] || {}), ...v };
+  const validated = settings(merged);
+  db.settingSet('model-settings', validated);
+  return validated;
+});
 
 ipcMain.handle('azure:pricing', async (_e, value) => {
   const known = new Set(modelRegistry().map(m => m.id));
@@ -272,6 +285,11 @@ ipcMain.handle('azure:pricing', async (_e, value) => {
       const n = Number(v?.[f]);
       if (!Number.isFinite(n) || n < 0 || n > 100000) throw Error('Rates must be numbers between 0 and 100000 (US dollars per 1 million tokens)');
       clean[id][f] = n;
+    }
+    if (v?.fastMultiplier !== undefined && v.fastMultiplier !== '' && v.fastMultiplier !== null) {
+      const m = Number(v.fastMultiplier);
+      if (!Number.isFinite(m) || m < 1 || m > 10) throw Error('The fast-mode rate multiplier must be between 1 and 10');
+      clean[id].fastMultiplier = m;
     }
   }
   if (!Object.keys(clean).length) throw Error('No valid model rates were provided');

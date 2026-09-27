@@ -113,7 +113,7 @@ export async function* sseEvents(stream) {
     }
   }
 }
-export async function runAzure({body,protocol,route,key,endpoint,signal,sink,preferences={},onThrottle}) {
+export async function runAzure({body,protocol,route,key,endpoint,signal,sink,preferences={},onThrottle,serviceTier=null}) {
   let payload;
   const effort=resolveEffort(body,route,preferences);
   if(route.protocol==='chat'){
@@ -129,6 +129,7 @@ export async function runAzure({body,protocol,route,key,endpoint,signal,sink,pre
     const requestedLimit=body.max_output_tokens??body.max_completion_tokens??body.max_tokens;
     if(requestedLimit!==undefined||route.maxOutputTokens<128000)payload.max_completion_tokens=outputLimit(body,route);
     if(route.effort??body.reasoning?.effort??body.reasoning_effort)payload.reasoning_effort=effort;
+    if(serviceTier)payload.service_tier=serviceTier;
   }else{
     payload=route.protocol==='responses' ? (protocol==='chat'?chatToResponses(body):{...body,store:false}) : chatToAnthropic(protocol==='chat'?body:responsesToChat(body));
     payload.model=route.deployment;payload.stream=true;
@@ -138,6 +139,10 @@ export async function runAzure({body,protocol,route,key,endpoint,signal,sink,pre
       payload.max_output_tokens=outputLimit(body,route);
       payload.reasoning={effort};
       delete payload.previous_response_id;
+      // A client's raw service_tier ('fast', 'flex') can be invalid on Azure;
+      // only the tier resolved by the bridge is forwarded.
+      delete payload.service_tier;
+      if(serviceTier)payload.service_tier=serviceTier;
     }
   }
   const url=endpoint+(route.protocol==='responses'?'/openai/responses?api-version=2025-04-01-preview':route.protocol==='chat'?`/openai/deployments/${encodeURIComponent(route.deployment)}/chat/completions?api-version=2025-01-01-preview`:'/anthropic/v1/messages');
@@ -174,13 +179,14 @@ export async function runAzure({body,protocol,route,key,endpoint,signal,sink,pre
         chatTools.set(tc.index??0,cur);
       }
       if(choice?.finish_reason)completed=true;
+      if(event.service_tier)sink.session.serviceTier=event.service_tier;
       if(event.usage)sink.session.usage={inputTokens:event.usage.prompt_tokens||0,outputTokens:event.usage.completion_tokens||0,cachedTokens:event.usage.prompt_tokens_details?.cached_tokens||0};
       continue;
     }
     if(event.type==='error'||event.type==='response.failed')throw new BridgeError(event.error?.message||event.response?.error?.message||'Azure stream failed',502);
     if(event.type==='response.output_text.delta')sink.text(event.delta);
     if(event.type==='response.output_item.done'&&event.item?.type==='function_call'){hasTools=true;sink.tool({callId:event.item.call_id,name:event.item.name,arguments:JSON.parse(event.item.arguments)});}
-    if(event.type==='response.completed') {completed=true;const u=event.response.usage;sink.session.usage={inputTokens:u?.input_tokens||0,outputTokens:u?.output_tokens||0,cachedTokens:u?.input_tokens_details?.cached_tokens||0};}
+    if(event.type==='response.completed') {completed=true;const u=event.response.usage;sink.session.usage={inputTokens:u?.input_tokens||0,outputTokens:u?.output_tokens||0,cachedTokens:u?.input_tokens_details?.cached_tokens||0};if(event.response?.service_tier)sink.session.serviceTier=event.response.service_tier;}
     if(event.type==='response.incomplete')throw new BridgeError(`Azure response incomplete: ${event.response?.incomplete_details?.reason||'output limit'}`,502);
     if(event.type==='message_start'){const u=event.message.usage;sink.session.usage={inputTokens:(u?.input_tokens||0)+(u?.cache_read_input_tokens||0)+(u?.cache_creation_input_tokens||0),outputTokens:0,cachedTokens:u?.cache_read_input_tokens||0};}
     if(event.type==='content_block_start') {blocks.set(event.index,{...event.content_block,json:''});if(event.content_block.type==='text')sink.text(event.content_block.text);}
