@@ -28,9 +28,16 @@ function azureCallId(id) {
   if (Buffer.byteLength(id, 'utf8') <= 64) return id;
   return `call_${createHash('sha256').update(id).digest('hex').slice(0, 59)}`;
 }
+const TOOL_ITEM = /^(function_call|custom_tool_call)(_output)?$/;
 export function normalizeResponsesCallIds(input) {
   if (!Array.isArray(input)) return input;
-  return input.map(item => item && ['function_call', 'function_call_output'].includes(item.type)
+  // An interrupted stream can leave a tool item without a call_id in a
+  // client's history, and it would then fail every later turn of that
+  // conversation. Drop such items, plus any output whose call is gone.
+  const linked = input.filter(item => !TOOL_ITEM.test(item?.type) || (typeof item.call_id === 'string' && item.call_id));
+  const callIds = new Set(linked.filter(item => TOOL_ITEM.test(item?.type) && !item.type.endsWith('_output')).map(item => item.call_id));
+  const kept = linked.filter(item => !(TOOL_ITEM.test(item?.type) && item.type.endsWith('_output')) || callIds.has(item.call_id));
+  return kept.map(item => item && ['function_call', 'function_call_output'].includes(item.type)
     ? { ...item, call_id: azureCallId(item.call_id) }
     : item);
 }
