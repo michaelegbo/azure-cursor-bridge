@@ -219,7 +219,7 @@ function renderModelCards(models,modelSettings){
   const idCode=document.createElement('code');
   idCode.textContent=m.id;
   const dep=document.createElement('p');
-  dep.textContent=(m.protocol==='claude-cli'?`Claude CLI model: ${m.deployment} · your Claude subscription`:`Azure deployment: ${m.deployment}`)+(m.builtin?'':' · custom'+(m.protocol==='chat'?' · chat completions':''));
+  dep.textContent=(m.protocol==='claude-cli'?`Claude CLI model: ${m.deployment} · your Claude subscription`:m.protocol==='chatgpt'?`ChatGPT plan model: ${m.deployment} · your ChatGPT sign-in · owner key only`:`Azure deployment: ${m.deployment}`)+(m.builtin?'':' · custom'+(m.protocol==='chat'?' · chat completions':''));
   const label=document.createElement('label');
   label.textContent='Reasoning mode';
   label.htmlFor=`effort-${m.id}`;
@@ -251,7 +251,7 @@ function renderModelCards(models,modelSettings){
   }else{
    fast=document.createElement('p');
    fast.className='fast-note';
-   fast.textContent=m.protocol==='claude-cli'||m.protocol==='anthropic'?'Fast mode: not available for this model through the bridge':'Fast mode: Azure does not offer priority processing for this model yet';
+   fast.textContent=m.protocol==='claude-cli'||m.protocol==='anthropic'||m.protocol==='chatgpt'?'Fast mode: not available for this model through the bridge':'Fast mode: Azure does not offer priority processing for this model yet';
   }
   card.append(name,idCode,dep,label,sel,fast,ctx,out,tpm);
   grid.append(card);
@@ -325,7 +325,7 @@ function renderCustomModels(models){
  tbody.replaceChildren();
  for(const m of models||[]){
   const tr=document.createElement('tr');
-  for(const value of [m.id+(m.builtin?' · Azure':''),m.deployment,{responses:'OpenAI',anthropic:'Anthropic',chat:'Chat completions','claude-cli':'Claude CLI'}[m.protocol]||m.protocol,(m.contextWindow||0).toLocaleString(),(m.maxOutputTokens||128000).toLocaleString(),m.tokensPerMinute?m.tokensPerMinute.toLocaleString():'Off',m.defaultEffort||m.effort||'medium']){
+  for(const value of [m.id+(m.builtin?' · Azure':''),m.deployment,{responses:'OpenAI',anthropic:'Anthropic',chat:'Chat completions','claude-cli':'Claude CLI',chatgpt:'ChatGPT plan'}[m.protocol]||m.protocol,(m.contextWindow||0).toLocaleString(),(m.maxOutputTokens||128000).toLocaleString(),m.tokensPerMinute?m.tokensPerMinute.toLocaleString():'Off',m.defaultEffort||m.effort||'medium']){
    const td=document.createElement('td');
    td.textContent=value;
    tr.append(td);
@@ -375,6 +375,14 @@ $('claude-login').addEventListener('click',async()=>{
  button.disabled=true;
  try{const r=await window.azureBridge.claudeLogin();$('claude-message').textContent=r.message;}
  catch(err){$('claude-message').textContent=cleanIpcError(err,'azure:claude-login');}
+ finally{button.disabled=false;}
+});
+
+$('chatgpt-login').addEventListener('click',async()=>{
+ const button=$('chatgpt-login');
+ button.disabled=true;
+ try{const r=await window.azureBridge.chatgptLogin();$('chatgpt-message').textContent=r.message;}
+ catch(err){$('chatgpt-message').textContent=cleanIpcError(err,'azure:chatgpt-login');}
  finally{button.disabled=false;}
 });
 
@@ -777,6 +785,7 @@ async function refresh(){
   renderModelCards(s.models,s.settings);
   renderCodexSwitch(s.codex,s.models);
   if(!codexPending&&s.codexRestart?.startsWith('Codex restart failed:'))$('codex-message').textContent=s.codexRestart;
+  if(s.chatgpt)$('chatgpt-status').textContent=s.chatgpt.installed?(s.chatgpt.loggedIn?(s.chatgpt.method==='api-key'?'Found · signed in with an API key — sign in with ChatGPT to use plan models':'Found · signed in with ChatGPT'):'Found · NOT signed in — ChatGPT plan models will fail until you log in'):'Codex CLI not found — install the Codex app';
   if(s.claudeCli)$('claude-cli-status').textContent=s.claudeCli.installed?(s.claudeCli.loggedIn?'Installed · logged in':'Installed · NOT logged in — Claude CLI models will fail until you log in'):'Not installed';
   if(s.busy)$('status').textContent=s.busy==='restart'?'Restarting bridge…':s.busy==='stop'?'Stopping bridge…':'Starting bridge…';
   else $('status').textContent=s.running?'Bridge running':'Bridge stopped';

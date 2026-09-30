@@ -23,6 +23,7 @@ await mkdir(state, { recursive: true });
 const codexSwitch = createCodexSwitch({ stateDir: state, assetsDir: here });
 const { settings, EFFORTS, FAST_SUPPORTED } = await import(pathToFileURL(path.join(bridgeRoot, 'src/model-settings.mjs')).href);
 const { MODELS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/azure-adapter.mjs')).href);
+const { codexCliPath } = await import(pathToFileURL(path.join(bridgeRoot, 'src/chatgpt-cli-adapter.mjs')).href);
 const { openDb } = await import(pathToFileURL(path.join(bridgeRoot, 'src/db.mjs')).href);
 
 let win;
@@ -154,7 +155,7 @@ ipcMain.handle('azure:models', async (_e, cmd) => {
     const deployment = String(cmd.model?.deployment || '').trim();
     if (!deployment || deployment.length > 80) throw Error('Enter the Azure deployment name');
     const protocol = cmd.model?.protocol;
-    if (!['responses', 'anthropic', 'chat', 'claude-cli'].includes(protocol)) throw Error('Pick the API protocol: responses (OpenAI models), anthropic (Claude on Azure), chat (chat-completions-only deployments like model-router), or claude-cli (your Claude subscription via the Claude CLI)');
+    if (!['responses', 'anthropic', 'chat', 'claude-cli', 'chatgpt'].includes(protocol)) throw Error('Pick the API protocol: responses (OpenAI models), anthropic (Claude on Azure), chat (chat-completions-only deployments like model-router), or claude-cli (your Claude subscription via the Claude CLI)');
     const contextWindow = Number(cmd.model?.contextWindow);
     if (!Number.isInteger(contextWindow) || contextWindow < 1000 || contextWindow > 10000000) throw Error('Context window must be between 1,000 and 10,000,000 tokens');
     const maxOutputTokens = Number(cmd.model?.maxOutputTokens);
@@ -229,6 +230,7 @@ ipcMain.handle('azure:snapshot', async () => {
     codex: process.platform === 'win32' ? await codexSwitch.status().catch(error => ({ enabled: false, error: error.message })) : { enabled: false, error: 'Codex switching is currently available on Windows.' },
     codexRestart: await readFile(path.join(state, 'codex-restart-status.txt'), 'utf8').catch(() => ''),
     claudeCli: claudeCliStatus(),
+    chatgpt: chatgptStatus(),
     azureKey: await azureKeyInfo(),
     pricing: db.settingGet('pricing') || DEFAULT_PRICING,
     pricingIsDefault: !db.settingGet('pricing'),
@@ -251,7 +253,8 @@ ipcMain.handle('azure:codex-switch', async (_e, enabled) => {
     if (!config?.apiKey) throw Error('The bridge owner key is missing.');
     const result = await health();
     if (result?.service !== 'azure-cursor-bridge') throw Error('Start the bridge before switching Codex to it.');
-    const models = modelRegistry();
+    // Codex already has the ChatGPT plan models natively.
+    const models = modelRegistry().filter(m => m.protocol !== 'chatgpt');
     await codexSwitch.enable(models, Number(config.port));
     await mirrorWrite('codex-model-catalog.json', await readFile(path.join(state, 'codex-model-catalog.json'), 'utf8'));
     var switchNote = '';
@@ -484,6 +487,38 @@ ipcMain.handle('azure:claude-login', async () => {
     spawn('x-terminal-emulator', ['-e', `${claudeCliPath} /login`], { detached: true }).unref();
   }
   return { message: 'A terminal opened with the Claude login — finish signing in there (it opens your browser), then Claude CLI models work immediately.' };
+});
+// `codex login status` is authoritative; cached and refreshed off-thread.
+const chatgptAuthCache = { at: 0, loggedIn: false, method: '', checking: false };
+function chatgptStatus() {
+  const exe = codexCliPath();
+  if (exe && Date.now() - chatgptAuthCache.at > 30000 && !chatgptAuthCache.checking) {
+    chatgptAuthCache.checking = true;
+    import('node:child_process').then(({ execFile }) => {
+      execFile(exe, ['login', 'status'], { windowsHide: true, timeout: 15000 }, (err, stdout, stderr) => {
+        const out = `${stdout || ''}\n${stderr || ''}`;
+        chatgptAuthCache.loggedIn = !err && /logged in/i.test(out) && !/not logged in/i.test(out);
+        chatgptAuthCache.method = /chatgpt/i.test(out) ? 'chatgpt' : /api key/i.test(out) ? 'api-key' : '';
+        chatgptAuthCache.at = Date.now();
+        chatgptAuthCache.checking = false;
+      });
+    }).catch(() => { chatgptAuthCache.checking = false; });
+  }
+  return { installed: Boolean(exe), loggedIn: chatgptAuthCache.loggedIn, method: chatgptAuthCache.method };
+}
+ipcMain.handle('azure:chatgpt-login', async () => {
+  const exe = codexCliPath();
+  if (!exe) throw Error('The Codex CLI was not found. Install the Codex app (or `npm i -g @openai/codex`) first.');
+  const { spawn } = await import('node:child_process');
+  if (process.platform === 'win32') {
+    spawn('cmd.exe', ['/c', 'start', 'Log in with ChatGPT', 'cmd', '/k', exe, 'login'], { detached: true, windowsHide: false }).unref();
+  } else if (process.platform === 'darwin') {
+    spawn('osascript', ['-e', `tell application "Terminal" to do script "'${exe}' login"`], { detached: true }).unref();
+  } else {
+    spawn('x-terminal-emulator', ['-e', `'${exe}' login`], { detached: true }).unref();
+  }
+  chatgptAuthCache.at = 0;
+  return { message: 'A terminal opened with the ChatGPT sign-in — finish it there (it opens your browser). ChatGPT plan models work as soon as you are signed in.' };
 });
 ipcMain.handle('azure:action', async (_e, action) => {
   if (action === 'copy-key') { clipboard.writeText((await json('config.json')).apiKey); return 'Bridge key copied'; }

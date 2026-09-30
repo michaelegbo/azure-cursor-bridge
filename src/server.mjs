@@ -7,6 +7,7 @@ import { createSink, sendJson, sendOpenAIError, openSse } from './openai-protoco
 import { BridgeError } from './errors.mjs';
 import { MODELS, routeModel, runAzure } from './azure-adapter.mjs';
 import { runClaudeCli } from './claude-cli-adapter.mjs';
+import { runChatgptCli } from './chatgpt-cli-adapter.mjs';
 import { settings, EFFORTS, resolveEffort, outputLimit, resolveServiceTier } from './model-settings.mjs';
 import { createTpmQueue } from './rate-limiter.mjs';
 import { openDb } from './db.mjs';
@@ -44,7 +45,7 @@ function registry() {
   let custom = [];
   try { custom = db.settingGet('custom-models') || []; } catch {}
   const extras = (Array.isArray(custom) ? custom : [])
-    .filter(m => m && CUSTOM_ID.test(m.id || '') && m.deployment && ['responses', 'anthropic', 'chat', 'claude-cli'].includes(m.protocol) && !taken.has(m.id))
+    .filter(m => m && CUSTOM_ID.test(m.id || '') && m.deployment && ['responses', 'anthropic', 'chat', 'claude-cli', 'chatgpt'].includes(m.protocol) && !taken.has(m.id))
     .map(m => ({ id: m.id, deployment: String(m.deployment), label: m.label || m.id, protocol: m.protocol, defaultEffort: m.defaultEffort, contextWindow: Number(m.contextWindow) || 1000000, maxInputTokens: m.maxInputTokens ? Number(m.maxInputTokens) : undefined, maxOutputTokens: Number(m.maxOutputTokens) || 128000, tokensPerMinute: Number(m.tokensPerMinute) || 0, fast: m.fast === true, fastSupported: ['responses', 'chat'].includes(m.protocol) }));
   return [...builtins, ...extras];
 }
@@ -145,7 +146,9 @@ const server = http.createServer(async (req, res) => {
     let body; try { body = JSON.parse(Buffer.concat(chunks)); } catch { throw new BridgeError('Invalid JSON', 400); }
     const route = routeModel(body.model, registry()), protocol = url.pathname.endsWith('/responses') ? 'responses' : 'chat';
     let endpoint = null;
-    if (route.protocol !== 'claude-cli') {
+    // ChatGPT plans are personal subscriptions, so guest keys can't use them.
+    if (route.protocol === 'chatgpt' && who.kind !== 'owner') throw new BridgeError('ChatGPT plan models can only be used with the bridge owner key.', 403);
+    if (!['claude-cli', 'chatgpt'].includes(route.protocol)) {
       if (!key) throw new BridgeError('No Azure API key is configured. Set it in the bridge app.', 503);
       endpoint = await azureEndpoint();
     }
@@ -192,6 +195,7 @@ const server = http.createServer(async (req, res) => {
       try { db.upsertRequest(entry); } catch {}
       const onThrottle = ms => { tpmQueue.pause(route.deployment, ms); if (route.tokensPerMinute > 0) { try { db.queueThrottle(route.id); } catch {} } };
       if (route.protocol === 'claude-cli') await runClaudeCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir });
+      else if (route.protocol === 'chatgpt') await runChatgptCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir });
       else await runAzure({ body, protocol, route, key, endpoint, signal: abort.signal, sink, preferences, onThrottle, serviceTier });
     } finally { clearInterval(heartbeat); clearTimeout(holdOpen); }
   } catch (error) {
