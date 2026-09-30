@@ -74,8 +74,41 @@ function toolInstructions(specs) {
   ].join('\n');
 }
 
-// Flattens a chat-completions or responses request into one prompt.
-export function buildPrompt(body, protocol) {
+// Codex rejects a turn above 1,048,576 characters, and ChatGPT-plan models
+// have a 272k-token context. Budget 3 characters per token (code and JSON run
+// that dense) and leave room for Codex's own instructions (~10k tokens) and
+// the reply.
+const PROMPT_CHAR_LIMIT = 1000000;
+export function promptBudget(contextWindow = 272000) {
+  return Math.min(PROMPT_CHAR_LIMIT, Math.floor(Math.max(50000, contextWindow - 40000) * 3));
+}
+
+function shorten(s, max) {
+  if (s.length <= max) return s;
+  const keep = Math.max(0, max - 100);
+  const head = Math.ceil(keep * 0.6), tail = keep - head;
+  return `${s.slice(0, head)}\n…[${(s.length - head - tail).toLocaleString('en-US')} characters left out by the bridge]…\n${s.slice(s.length - tail)}`;
+}
+
+// Keeps the newest messages that fit. The newest message is always kept
+// (shortened if it is huge); older ones are dropped with a note.
+function fitTranscript(entries, budget) {
+  const kept = [];
+  let used = 0, i = entries.length - 1;
+  for (; i >= 0; i--) {
+    const room = budget - used - 2;
+    if (entries[i].length <= room) { kept.unshift(entries[i]); used += entries[i].length + 2; continue; }
+    if (!kept.length || room >= 4000) { kept.unshift(shorten(entries[i], Math.max(room, 4000))); i--; }
+    break;
+  }
+  const dropped = i + 1;
+  if (dropped > 0) kept.unshift(`[${dropped} earlier message${dropped === 1 ? '' : 's'} left out by the bridge: the full conversation is longer than this model's context.]`);
+  return { text: kept.join('\n\n'), dropped };
+}
+
+// Flattens a chat-completions or responses request into one prompt that fits
+// within maxChars.
+export function buildPrompt(body, protocol, maxChars = promptBudget()) {
   const system = [];
   const transcript = [];
   const names = new Map();
@@ -108,13 +141,17 @@ export function buildPrompt(body, protocol) {
     }
   }
   const specs = toolSpecs(body.tools);
-  const header = [
+  let header = [
     '# Conversation from a client application',
     'Reply to the last Human message as the Assistant, following the client instructions below. You have no tools of your own in this environment; only the client tools listed (if any) exist.',
     system.length ? `## Client instructions\n${system.join('\n\n')}` : '',
     specs.length ? toolInstructions(specs) : '',
   ].filter(Boolean).join('\n\n');
-  return { prompt: `${header}\n\n# Conversation\n\n${transcript.join('\n\n') || 'Human:\nHello'}`, specs };
+  if (header.length > maxChars * 0.6) header = shorten(header, Math.floor(maxChars * 0.6));
+  const { text: conversation, dropped } = transcript.length
+    ? fitTranscript(transcript, maxChars - header.length - 20)
+    : { text: 'Human:\nHello', dropped: 0 };
+  return { prompt: `${header}\n\n# Conversation\n\n${conversation}`, specs, dropped };
 }
 
 export function clampEffort(deployment, effort) {
@@ -138,21 +175,40 @@ export async function runChatgptCli({ body, protocol, route, effort, sink, signa
   const exe = codexCliPath();
   if (!exe) throw new BridgeError('The Codex CLI is not installed on the bridge machine. Install the Codex app or `npm i -g @openai/codex`, then use “Log in with ChatGPT”.', 503);
   if (!/^[a-z0-9][a-z0-9.\-]{1,60}$/i.test(route.deployment)) throw new BridgeError('Invalid ChatGPT model name', 400);
-  const { prompt, specs } = buildPrompt(body, protocol);
   // An empty working folder, so even a misbehaving run has nothing to read.
   const workDir = path.join(stateDir, 'chatgpt-empty');
   mkdirSync(workDir, { recursive: true });
-
-  const child = spawn(exe, codexArgs({ deployment: route.deployment, effort, workDir }), { cwd: workDir, env: { ...process.env }, windowsHide: true });
-  child.stdin.end(prompt);
   sink.open({ model: route.id, upstreamModel: route.deployment, provider: 'chatgpt', routeMode: 'chatgpt', responseId: `resp_${randomUUID().replaceAll('-', '')}` });
+
+  // Nothing reaches the client until a run finishes, so a run rejected as too
+  // long can safely be retried once with a smaller share of the conversation.
+  let budget = promptBudget(route.contextWindow), specs = [], finalText = '';
+  for (let attempt = 0; ; attempt++) {
+    const built = buildPrompt(body, protocol, budget);
+    specs = built.specs;
+    try {
+      finalText = await runOnce(exe, built.prompt, { route, effort, workDir, sink, signal });
+      break;
+    } catch (error) {
+      if (attempt === 0 && error.tooLong && !signal?.aborted) { budget = Math.floor(budget * 0.6); continue; }
+      throw error;
+    }
+  }
+  return deliver(finalText, specs, sink);
+}
+
+function runOnce(exe, prompt, { route, effort, workDir, sink, signal }) {
+  const child = spawn(exe, codexArgs({ deployment: route.deployment, effort, workDir }), { cwd: workDir, env: { ...process.env }, windowsHide: true });
+  // Codex may exit before reading a large prompt; an unhandled EPIPE on stdin
+  // would otherwise crash the whole proxy. The exit handler reports the error.
+  child.stdin.on('error', () => {});
+  child.stdin.end(prompt);
   const onAbort = () => { try { child.kill(); } catch {} };
   signal?.addEventListener('abort', onAbort);
 
   let finalText = '', errorMessage = null, blocked = null, stderrText = '';
   child.stderr.on('data', d => { if (stderrText.length < 4000) stderrText += d; });
-  try {
-    await new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
       let buffer = '';
       const timeout = setTimeout(() => { try { child.kill(); } catch {} reject(new BridgeError('ChatGPT (Codex CLI) timed out', 504)); }, 600000);
       const handle = line => {
@@ -177,23 +233,28 @@ export async function runChatgptCli({ body, protocol, route, effort, sink, signa
         let pos;
         while ((pos = buffer.indexOf('\n')) >= 0) { try { handle(buffer.slice(0, pos)); } catch {} buffer = buffer.slice(pos + 1); }
       });
-      child.on('error', error => { clearTimeout(timeout); reject(new BridgeError(`Could not start the Codex CLI: ${error.message}`, 503)); });
+      child.on('error', error => { clearTimeout(timeout); signal?.removeEventListener('abort', onAbort); reject(new BridgeError(`Could not start the Codex CLI: ${error.message}`, 503)); });
       child.on('exit', code => {
         clearTimeout(timeout);
+        signal?.removeEventListener('abort', onAbort);
         if (buffer) { try { handle(buffer); } catch {} }
         if (blocked) return reject(new BridgeError(`Blocked: the ChatGPT model tried to use a local tool (${blocked}); bridge requests may not act on this machine.`, 502));
         const problem = errorMessage || (!finalText && code !== 0 ? stderrText.trim().split('\n').pop() : null);
         if (problem) {
+          if (/input_too_large|context.{0,20}(length|window|exceed)|too long|maximum length/i.test(problem)) {
+            const err = new BridgeError('This conversation is too long for the ChatGPT model even after trimming older messages. Start a new conversation.', 413);
+            err.tooLong = true;
+            return reject(err);
+          }
           const auth = /not logged in|log ?in|401|unauthori[sz]ed|sign in|auth/i.test(problem);
           return reject(new BridgeError(auth ? 'ChatGPT is not signed in on the bridge. Open the bridge app and use “Log in with ChatGPT”.' : String(problem).slice(0, 300), auth ? 503 : 502));
         }
-        resolve();
+        resolve(finalText);
       });
-    });
-  } finally {
-    signal?.removeEventListener('abort', onAbort);
-  }
+  });
+}
 
+function deliver(finalText, specs, sink) {
   const idx = finalText.indexOf(CALL_OPEN);
   if (idx >= 0) {
     const before = finalText.slice(0, idx).replace(/\s+$/, '');

@@ -1,6 +1,42 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildPrompt, clampEffort, codexArgs } from '../src/chatgpt-cli-adapter.mjs';
+import { buildPrompt, clampEffort, codexArgs, promptBudget } from '../src/chatgpt-cli-adapter.mjs';
+
+test('a conversation too long for the model keeps its newest messages and stays under the Codex limit', () => {
+  const messages = [{ role: 'system', content: 'Instructions stay.' }];
+  for (let i = 0; i < 400; i++) {
+    messages.push({ role: 'user', content: `question ${i} ` + 'x'.repeat(3000) });
+    messages.push({ role: 'assistant', content: `answer ${i} ` + 'y'.repeat(3500) });
+  }
+  messages.push({ role: 'user', content: 'FINAL QUESTION' });
+  const full = messages.reduce((n, m) => n + m.content.length, 0);
+  assert.ok(full > 2_600_000, 'about the size of the failing conversation');
+  const budget = promptBudget(272000);
+  const { prompt, dropped } = buildPrompt({ messages }, 'chat', budget);
+  assert.ok(prompt.length <= budget, `${prompt.length} <= ${budget}`);
+  assert.ok(prompt.length < 1_048_576, 'under the Codex per-turn cap');
+  assert.ok(dropped > 0);
+  assert.match(prompt, /Instructions stay\./);
+  assert.match(prompt, /earlier messages left out by the bridge/);
+  assert.ok(prompt.trimEnd().endsWith('FINAL QUESTION'), 'the newest message is always kept');
+  assert.match(prompt, /answer 399 /, 'the most recent turns are kept');
+  assert.doesNotMatch(prompt, /question 0 /, 'the oldest turns are dropped');
+});
+
+test('a single huge message is shortened in the middle rather than dropped', () => {
+  const { prompt, dropped } = buildPrompt({ messages: [{ role: 'user', content: 'START' + 'z'.repeat(2_000_000) + 'END' }] }, 'chat', 100_000);
+  assert.equal(dropped, 0);
+  assert.ok(prompt.length <= 100_000);
+  assert.match(prompt, /START/);
+  assert.match(prompt, /END$/);
+  assert.match(prompt, /characters left out by the bridge/);
+});
+
+test('short conversations are passed through untouched', () => {
+  const { prompt, dropped } = buildPrompt({ messages: [{ role: 'user', content: 'hi' }] }, 'chat');
+  assert.equal(dropped, 0);
+  assert.doesNotMatch(prompt, /left out by the bridge/);
+});
 
 test('every Codex tool that could act on this machine is switched off', () => {
   const args = codexArgs({ deployment: 'gpt-6-astra', effort: 'high', workDir: 'C:/empty' });
