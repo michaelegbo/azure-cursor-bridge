@@ -37,7 +37,7 @@ export function normalizeResponsesCallIds(input) {
   const linked = input.filter(item => !TOOL_ITEM.test(item?.type) || (typeof item.call_id === 'string' && item.call_id));
   const callIds = new Set(linked.filter(item => TOOL_ITEM.test(item?.type) && !item.type.endsWith('_output')).map(item => item.call_id));
   const kept = linked.filter(item => !(TOOL_ITEM.test(item?.type) && item.type.endsWith('_output')) || callIds.has(item.call_id));
-  return kept.map(item => item && ['function_call', 'function_call_output'].includes(item.type)
+  return kept.map(item => item && ['function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output'].includes(item.type)
     ? { ...item, call_id: azureCallId(item.call_id) }
     : item);
 }
@@ -193,6 +193,11 @@ export async function runAzure({body,protocol,route,key,endpoint,signal,sink,pre
     if(event.type==='error'||event.type==='response.failed')throw new BridgeError(event.error?.message||event.response?.error?.message||'Azure stream failed',502);
     if(event.type==='response.output_text.delta')sink.text(event.delta);
     if(event.type==='response.output_item.done'&&event.item?.type==='function_call'){hasTools=true;sink.tool({callId:event.item.call_id,name:event.item.name,arguments:JSON.parse(event.item.arguments)});}
+    if(event.type==='response.output_item.done'&&event.item?.type==='custom_tool_call'){
+      hasTools=true;
+      const call={callId:event.item.call_id,name:event.item.name,input:event.item.input??''};
+      if(sink.customTool)sink.customTool(call);else sink.tool({callId:call.callId,name:call.name,arguments:{input:call.input}});
+    }
     if(event.type==='response.completed') {completed=true;const u=event.response.usage;sink.session.usage={inputTokens:u?.input_tokens||0,outputTokens:u?.output_tokens||0,cachedTokens:u?.input_tokens_details?.cached_tokens||0};if(event.response?.service_tier)sink.session.serviceTier=event.response.service_tier;}
     if(event.type==='response.incomplete')throw new BridgeError(`Azure response incomplete: ${event.response?.incomplete_details?.reason||'output limit'}`,502);
     if(event.type==='message_start'){const u=event.message.usage;sink.session.usage={inputTokens:(u?.input_tokens||0)+(u?.cache_read_input_tokens||0)+(u?.cache_creation_input_tokens||0),outputTokens:0,cachedTokens:u?.cache_read_input_tokens||0};}

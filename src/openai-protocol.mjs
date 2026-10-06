@@ -313,6 +313,29 @@ class ResponsesSink {
     }
   }
 
+  // Freeform tools (Codex `exec`, `apply_patch`) are "custom" tools: their
+  // calls carry a raw `input` string instead of JSON `arguments`.
+  customTool(call) {
+    if (this.closed) return;
+    this.#closeMessage();
+    const item = {
+      type: "custom_tool_call",
+      id: `ctc_${randomUUID().replaceAll("-", "")}`,
+      call_id: call.callId,
+      name: call.name,
+      input: call.input ?? "",
+      status: "completed",
+    };
+    const outputIndex = this.output.length;
+    this.output.push(item);
+    if (this.stream) {
+      this.#event("response.output_item.added", { output_index: outputIndex, item: { ...item, input: "", status: "in_progress" } });
+      this.#event("response.custom_tool_call_input.delta", { item_id: item.id, output_index: outputIndex, delta: item.input });
+      this.#event("response.custom_tool_call_input.done", { item_id: item.id, output_index: outputIndex, input: item.input });
+      this.#event("response.output_item.done", { output_index: outputIndex, item });
+    }
+  }
+
   completeForTool() {
     this.#finish("tool_requested");
   }
