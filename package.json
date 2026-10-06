@@ -97,6 +97,7 @@
     "linux": {
       "icon": "icon.png",
       "category": "Development",
+      "maintainer": "Azure Cursor Bridge <michaelegbo@users.noreply.github.com>",
       "target": [
         "AppImage",
         "deb"
