@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 // Cross-platform lifecycle manager. The proxy server runs on Electron's own
 // bundled Node (ELECTRON_RUN_AS_NODE), so no separate Node installation is
 // needed. cloudflared is bundled per platform under bridge/vendor.
-export function createRuntime({ stateDir, bridgeRoot, secrets, log }) {
+export function createRuntime({ stateDir, bridgeRoot, secrets, log, tunnelPrefs = () => ({}) }) {
   const serverPath = path.join(bridgeRoot, 'src', 'server.mjs');
   const cloudflaredPath = () => {
     const name = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
@@ -90,17 +90,55 @@ export function createRuntime({ stateDir, bridgeRoot, secrets, log }) {
     while (Date.now() < deadline && await health(config?.port || 17834)) await delay(200);
   }
 
-  async function startTunnel() {
-    const config = await readJson('config.json');
-    const existing = await readJson('tunnel.json');
-    if (existing?.publicUrl && await pidAlive('tunnel.pid') && await publicHealth(existing.publicUrl)) return existing;
-    await killPid('tunnel.pid');
-    await rm(statePath('tunnel.json'), { force: true }).catch(() => {});
-
+  // Which tunnel to run: the user's own Cloudflare tunnel (permanent hostname)
+  // when configured, otherwise a temporary public URL; or none ('off').
+  async function tunnelPlan() {
+    const prefs = (await tunnelPrefs()) || {};
     const named = await readJson('named-tunnel.json');
-    const token = named ? await secrets.get('tunnel-token') : null;
+    const token = named?.hostname ? await secrets.get('tunnel-token') : null;
+    const configured = Boolean(named?.hostname && token);
+    let mode = ['named', 'quick', 'off'].includes(prefs.tunnelMode) ? prefs.tunnelMode : (configured ? 'named' : 'quick');
+    let note = null;
+    if (mode === 'named' && !configured) {
+      if (prefs.tunnelFallback === false) throw Error('No Cloudflare tunnel is configured. Add a hostname and tunnel token in Settings → Public URL, or choose a temporary public URL.');
+      mode = 'quick';
+      note = 'No Cloudflare tunnel is configured, so a temporary public URL is used.';
+    }
+    return { mode, named, token, note, fallback: prefs.tunnelFallback !== false };
+  }
+
+  async function startTunnel() {
+    const plan = await tunnelPlan();
+    const existing = await readJson('tunnel.json');
+    const existingMode = existing?.mode || 'quick';
+    const sameTarget = plan.mode === existingMode && (plan.mode !== 'named' || existing?.publicUrl === `https://${plan.named.hostname}`);
+    if (plan.mode !== 'off' && sameTarget && existing?.publicUrl && await pidAlive('tunnel.pid') && await publicHealth(existing.publicUrl)) return existing;
+    await stopTunnel();
+    if (plan.mode === 'off') {
+      const state = { mode: 'off', publicUrl: '', baseUrl: '', startedAt: new Date().toISOString() };
+      await writeFile(statePath('tunnel.json'), JSON.stringify(state, null, 2));
+      return state;
+    }
+    if (plan.mode === 'quick') return finishTunnel(await launchTunnel('quick', plan), plan.note);
+    try {
+      return finishTunnel(await launchTunnel('named', plan), null);
+    } catch (error) {
+      if (!plan.fallback) throw error;
+      log?.(`own tunnel failed, falling back to a temporary URL: ${error.message}`);
+      return finishTunnel(await launchTunnel('quick', plan), `Your Cloudflare tunnel failed (${error.message}), so a temporary public URL is used instead.`);
+    }
+  }
+
+  async function finishTunnel(state, note) {
+    if (note) state.note = note;
+    await writeFile(statePath('tunnel.json'), JSON.stringify(state, null, 2));
+    return state;
+  }
+
+  async function launchTunnel(kind, { named, token }) {
+    const config = await readJson('config.json');
     let child, publicUrl;
-    if (named && token) {
+    if (kind === 'named') {
       child = spawnLogged(cloudflaredPath(), ['tunnel', '--no-autoupdate', '--protocol', 'http2', 'run'], { TUNNEL_TOKEN: token }, 'tunnel.log', 'tunnel-error.log');
       publicUrl = `https://${named.hostname}`;
     } else {
@@ -119,7 +157,7 @@ export function createRuntime({ stateDir, bridgeRoot, secrets, log }) {
     }
     await writeFile(statePath('tunnel.pid'), String(child.pid));
 
-    if (named && token) {
+    if (kind === 'named') {
       // Permanent hostname: DNS already exists, so reachability is a hard gate.
       const deadline = Date.now() + 60000;
       let healthy = false;
@@ -159,9 +197,7 @@ export function createRuntime({ stateDir, bridgeRoot, secrets, log }) {
       }
     }
 
-    const state = { pid: child.pid, publicUrl, baseUrl: `${publicUrl}/v1`, startedAt: new Date().toISOString(), ...(named ? { mode: 'named', tunnelName: named.tunnelName } : {}) };
-    await writeFile(statePath('tunnel.json'), JSON.stringify(state, null, 2));
-    return state;
+    return { pid: child.pid, publicUrl, baseUrl: `${publicUrl}/v1`, startedAt: new Date().toISOString(), mode: kind, ...(kind === 'named' ? { tunnelName: named.tunnelName || named.hostname } : {}) };
   }
 
   async function stopTunnel() { await killPid('tunnel.pid'); await rm(statePath('tunnel.json'), { force: true }).catch(() => {}); }
@@ -171,7 +207,7 @@ export function createRuntime({ stateDir, bridgeRoot, secrets, log }) {
     const status = { at: new Date().toISOString(), proxy: { ok: true }, tunnel: { ok: false, error: null } };
     try {
       const tunnel = await startTunnel();
-      status.tunnel = { ok: true, error: null, baseUrl: tunnel.baseUrl, publicUrl: tunnel.publicUrl };
+      status.tunnel = { ok: true, error: null, mode: tunnel.mode, baseUrl: tunnel.baseUrl, publicUrl: tunnel.publicUrl, note: tunnel.note || null };
     } catch (error) {
       status.tunnel.error = error.message;
       log?.(`tunnel failed: ${error.message}`);
@@ -184,5 +220,18 @@ export function createRuntime({ stateDir, bridgeRoot, secrets, log }) {
 
   async function restartProxy() { await stopProxy(); await startProxy(); }
 
-  return { start, stop, startProxy, stopProxy, restartProxy, startTunnel, stopTunnel, health, readJson };
+  // Re-apply the public URL settings; the local proxy keeps serving. Without
+  // force a tunnel that already matches the settings is kept as is.
+  async function restartTunnel({ force = true } = {}) {
+    if (force) await stopTunnel();
+    const status = { at: new Date().toISOString(), proxy: { ok: true }, tunnel: { ok: false, error: null } };
+    try {
+      const tunnel = await startTunnel();
+      status.tunnel = { ok: true, error: null, mode: tunnel.mode, baseUrl: tunnel.baseUrl, publicUrl: tunnel.publicUrl, note: tunnel.note || null };
+    } catch (error) { status.tunnel.error = error.message; }
+    await writeFile(statePath('start-status.json'), JSON.stringify(status, null, 2));
+    return status;
+  }
+
+  return { start, stop, startProxy, stopProxy, restartProxy, startTunnel, stopTunnel, restartTunnel, tunnelPlan, health, readJson };
 }

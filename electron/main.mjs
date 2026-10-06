@@ -1,6 +1,7 @@
-import { app, BrowserWindow, ipcMain, clipboard } from 'electron';
+import { app, BrowserWindow, ipcMain, clipboard, shell } from 'electron';
+import net from 'node:net';
 import { appendFile, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -23,8 +24,9 @@ await mkdir(state, { recursive: true });
 const codexSwitch = createCodexSwitch({ stateDir: state, assetsDir: here });
 const { settings, EFFORTS, FAST_SUPPORTED } = await import(pathToFileURL(path.join(bridgeRoot, 'src/model-settings.mjs')).href);
 const { MODELS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/azure-adapter.mjs')).href);
-const { codexCliPath } = await import(pathToFileURL(path.join(bridgeRoot, 'src/chatgpt-cli-adapter.mjs')).href);
-const { claudeAccountDir } = await import(pathToFileURL(path.join(bridgeRoot, 'src/claude-cli-adapter.mjs')).href);
+const { codexCliPath, chatgptAccountDir } = await import(pathToFileURL(path.join(bridgeRoot, 'src/chatgpt-cli-adapter.mjs')).href);
+const { claudeAccountDir, claudeCliPath: findClaudeCli } = await import(pathToFileURL(path.join(bridgeRoot, 'src/claude-cli-adapter.mjs')).href);
+const { appSettings, normalizeAppSettings, DEFAULT_CUSTOM_MODELS, BLOAT_LEVEL_IDS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/app-settings.mjs')).href);
 const { openDb } = await import(pathToFileURL(path.join(bridgeRoot, 'src/db.mjs')).href);
 
 let win;
@@ -53,7 +55,7 @@ async function mirrorWrite(name, text) {
 }
 
 const secrets = createSecrets(state);
-const runtime = createRuntime({ stateDir: state, bridgeRoot, secrets, log: lifecycleLog });
+const runtime = createRuntime({ stateDir: state, bridgeRoot, secrets, log: lifecycleLog, tunnelPrefs: () => (db ? appSettings(db) : {}) });
 let db;
 
 async function health() {
@@ -79,13 +81,26 @@ async function runLifecycle(action) {
     await lifecycleLog('stop complete');
     return 'Bridge stopped';
   }
-  if (action === 'restart') await runtime.stopProxy();
+  // 'tunnel' re-applies the public URL settings (keeps a matching tunnel);
+  // 'tunnel-reconnect' always reconnects it.
+  if (action === 'tunnel' || action === 'tunnel-reconnect') {
+    const status = await runtime.restartTunnel({ force: action === 'tunnel-reconnect' });
+    await lifecycleLog(`${action} (${status.tunnel.mode || 'failed'})`);
+    return tunnelMessage('Public URL updated', status);
+  }
+  // 'restart-all' (port change): the tunnel must follow the proxy to the new port.
+  if (action === 'restart-all') await runtime.stop();
+  else if (action === 'restart') await runtime.stopProxy();
   const status = await runtime.start();
   const result = await health();
   if (result?.service !== 'azure-cursor-bridge') throw Error('The bridge started but the local health check failed.');
   await lifecycleLog(`${action} healthy`);
-  const base = action === 'restart' ? 'Bridge restarted' : 'Bridge started';
-  if (status?.tunnel?.ok === false) return `${base} locally. Tunnel failed: ${status.tunnel.error}`;
+  return tunnelMessage(action === 'start' ? 'Bridge started' : 'Bridge restarted', status);
+}
+function tunnelMessage(base, status) {
+  if (status?.tunnel?.ok === false) return `${base} locally. Public URL failed: ${status.tunnel.error}`;
+  if (status?.tunnel?.mode === 'off') return `${base} — local only (public URL is off in Settings).`;
+  if (status?.tunnel?.note) return `${base}. ${status.tunnel.note}`;
   return base;
 }
 
@@ -216,6 +231,178 @@ async function testAzureKey(keyValue, endpointOverride) {
   return { ok: false, message: (response.status === 401 || response.status === 403 ? `Key rejected by Azure: ${reason}` : `Azure error (key may still be valid): ${reason}`).slice(0, 300) };
 }
 
+// ── Settings page: public URL (Cloudflare), bridge server, tools, local data ──
+const HOSTNAME = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const TUNNEL_TOKEN = /^[A-Za-z0-9_=+/-]{40,4096}$/;
+async function mirrorRemove(name) { if (mirrorState) await rm(path.join(mirrorState, name), { force: true, recursive: true }).catch(() => {}); }
+async function tunnelConfigInfo() {
+  const named = await json('named-tunnel.json');
+  return { hostname: named?.hostname || '', hasToken: secrets.has('tunnel-token'), tunnelName: named?.tunnelName || '' };
+}
+function systemInfo() {
+  const s = appSettings(db);
+  const claude = claudeExe(), codex = codexExe();
+  const loginItemSupported = process.platform === 'win32' || process.platform === 'darwin';
+  return {
+    platform: process.platform,
+    version: app.getVersion(),
+    loginItemSupported,
+    openAtLogin: loginItemSupported ? app.getLoginItemSettings().openAtLogin : false,
+    claudeCli: { path: claude, found: existsSync(claude), custom: Boolean(s.claudeCliPath) },
+    codexCli: { path: codex || '', found: Boolean(codex), custom: Boolean(s.codexCliPath) },
+  };
+}
+const fileSize = p => { try { return statSync(p).size; } catch { return 0; } };
+function dataInfo() {
+  const file = path.join(state, 'bridge.db');
+  return { dir: state, file, bytes: fileSize(file) + fileSize(`${file}-wal`), ...db.stats() };
+}
+async function writeConfig(cfg) {
+  const text = JSON.stringify(cfg, null, 2);
+  await writeFile(path.join(state, 'config.json'), text);
+  await mirrorWrite('config.json', text);
+}
+function saveAppSettings(patch) {
+  const next = normalizeAppSettings({ ...appSettings(db), ...patch });
+  db.settingSet('app-settings', next);
+  return next;
+}
+
+ipcMain.handle('azure:tunnel', async (_e, cmd) => {
+  const action = cmd?.action;
+  if (action === 'reconnect') return { message: await queueLifecycle('tunnel-reconnect') };
+  if (action === 'remove') {
+    await rm(path.join(state, 'named-tunnel.json'), { force: true });
+    await mirrorRemove('named-tunnel.json');
+    await secrets.remove('tunnel-token');
+    await rm(path.join(state, 'tunnel-token.dpapi'), { force: true }); // legacy copy would be re-imported
+    if (appSettings(db).tunnelMode === 'named') saveAppSettings({ tunnelMode: 'auto' });
+    return { message: `Cloudflare tunnel removed from this bridge. ${await queueLifecycle('tunnel')}` };
+  }
+  if (action !== 'save') throw Error('Unknown tunnel action');
+  const mode = ['auto', 'named', 'quick', 'off'].includes(cmd.mode) ? cmd.mode : 'auto';
+  const hostname = String(cmd.hostname || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/[/:].*$/, '');
+  if (hostname && !HOSTNAME.test(hostname)) throw Error('Enter just the hostname, for example bridge.example.com');
+  // Accept the token alone or the whole "cloudflared service install <token>" command.
+  const rawToken = String(cmd.token || '').trim();
+  const token = rawToken ? rawToken.split(/\s+/).filter(t => TUNNEL_TOKEN.test(t)).pop() : '';
+  if (rawToken && !token) throw Error('That does not look like a Cloudflare tunnel token. Paste the long token from the tunnel’s install command in the Cloudflare dashboard.');
+  const current = await tunnelConfigInfo();
+  if (mode === 'named' && !((hostname || current.hostname) && (token || current.hasToken))) throw Error('To use your own Cloudflare tunnel, enter both its public hostname and its tunnel token.');
+  const prior = await json('named-tunnel.json') || {};
+  const hostChanged = Boolean(hostname) && hostname !== current.hostname;
+  if (hostChanged) {
+    const text = JSON.stringify({ ...prior, hostname }, null, 2);
+    await writeFile(path.join(state, 'named-tunnel.json'), text);
+    await mirrorWrite('named-tunnel.json', text);
+  }
+  if (token) await secrets.set('tunnel-token', token);
+  const before = appSettings(db);
+  saveAppSettings({ tunnelMode: mode, tunnelFallback: cmd.fallback !== false });
+  if (!hostChanged && !token && before.tunnelMode === mode) return { message: 'Saved.' };
+  return { message: await queueLifecycle(hostChanged || token ? 'tunnel-reconnect' : 'tunnel') };
+});
+
+ipcMain.handle('azure:server', async (_e, cmd) => {
+  if (cmd?.action === 'login-item') {
+    if (!(process.platform === 'win32' || process.platform === 'darwin')) throw Error('On Linux, add Azure Cursor Bridge to your desktop’s startup applications instead.');
+    app.setLoginItemSettings({ openAtLogin: cmd.enabled === true });
+    return { message: cmd.enabled ? 'The bridge will start when you sign in to this computer.' : 'The bridge will no longer start at sign-in.' };
+  }
+  if (cmd?.action !== 'port') throw Error('Unknown server action');
+  const port = Number(cmd.port);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw Error('The port must be a whole number between 1024 and 65535.');
+  const cfg = await json('config.json');
+  if (cfg.port === port) return { message: `The bridge already uses port ${port}.` };
+  await new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once('error', () => reject(Error(`Port ${port} is already in use on this computer. Pick another.`)));
+    probe.once('listening', () => probe.close(resolve));
+    probe.listen(port, '127.0.0.1');
+  });
+  await writeConfig({ ...cfg, port });
+  const message = await queueLifecycle('restart-all');
+  const { hostname } = await tunnelConfigInfo();
+  return { message: `${message} Now on port ${port}.${hostname ? ` In the Cloudflare dashboard, point your tunnel’s public hostname at http://localhost:${port}.` : ''} If Codex is in bridge mode, switch it off and on again.` };
+});
+
+ipcMain.handle('azure:app-settings', async (_e, patch) => {
+  const p = patch || {};
+  const clean = {};
+  if ('analyzerModel' in p) {
+    if (!modelRegistry().some(m => m.id === p.analyzerModel)) throw Error('Pick one of the bridge models for request analysis.');
+    clean.analyzerModel = p.analyzerModel;
+  }
+  if ('bloatLevel' in p) {
+    if (!BLOAT_LEVEL_IDS.includes(p.bloatLevel)) throw Error('Choose a bloat remover level.');
+    clean.bloatLevel = p.bloatLevel;
+  }
+  if ('bloatModel' in p) {
+    if (!modelRegistry().some(m => m.id === p.bloatModel)) throw Error('Pick one of the bridge models to write the summaries.');
+    clean.bloatModel = p.bloatModel;
+  }
+  for (const k of ['claudeCliPath', 'codexCliPath']) if (k in p) {
+    const v = String(p[k] || '').trim();
+    if (v && !(existsSync(v) && statSync(v).isFile())) throw Error(`No program found at ${v}`);
+    clean[k] = v;
+  }
+  for (const [k, min, max, name] of [['requestHistoryLimit', 50, 10000, 'Request history'], ['breakdownLimit', 10, 1000, 'Request breakdowns']]) if (k in p) {
+    const n = Number(p[k]);
+    if (!Number.isInteger(n) || n < min || n > max) throw Error(`${name} must be between ${min} and ${max}.`);
+    clean[k] = n;
+  }
+  saveAppSettings(clean);
+  db.applyHistoryLimits();
+  if ('claudeCliPath' in clean) claudeAccounts.clearCache();
+  if ('codexCliPath' in clean) chatgptAccounts.clearCache();
+  return { message: 'Settings saved. They apply to the next request.' };
+});
+
+const DATA_PARTS = ['requests', 'usage', 'preferences', 'models', 'guestKeys', 'claudeAccounts', 'chatgptAccounts', 'azure', 'tunnel'];
+ipcMain.handle('azure:data', async (_e, cmd) => {
+  if (cmd?.action === 'open-folder') {
+    const error = await shell.openPath(state);
+    if (error) throw Error(error);
+    return { message: 'Opened the data folder.' };
+  }
+  if (cmd?.action === 'compact') return { message: db.compact() ? 'Database compacted.' : 'The bridge is busy writing right now. Try again in a moment.' };
+  if (cmd?.action !== 'clear') throw Error('Unknown data action');
+  const parts = [...new Set((cmd.parts || []).filter(p => DATA_PARTS.includes(p)))];
+  if (!parts.length) throw Error('Choose what to clear.');
+  const before = appSettings(db);
+  if (parts.includes('requests')) db.clearRequests();
+  if (parts.includes('usage')) db.clearUsage();
+  if (parts.includes('preferences')) for (const k of ['model-settings', 'pricing', 'app-settings']) db.settingDelete(k);
+  if (parts.includes('models')) db.settingSet('custom-models', DEFAULT_CUSTOM_MODELS.map(m => ({ ...m })));
+  if (parts.includes('guestKeys')) db.clearGuestKeys();
+  if (parts.includes('claudeAccounts')) await claudeAccounts.removeAll();
+  if (parts.includes('chatgptAccounts')) await chatgptAccounts.removeAll();
+  if (parts.includes('azure')) {
+    const manifest = db.settingGet('azure-key-manifest');
+    for (const v of manifest?.versions || []) await secrets.remove(`azure-key-v${v.v}`);
+    await secrets.remove('azure-key');
+    for (const name of ['azure.json', 'azure-key.dpapi', 'azure-key-versions']) {
+      await rm(path.join(state, name), { force: true, recursive: true });
+      await mirrorRemove(name);
+    }
+    db.settingDelete('azure-key-manifest');
+  }
+  if (parts.includes('tunnel')) {
+    await rm(path.join(state, 'named-tunnel.json'), { force: true });
+    await mirrorRemove('named-tunnel.json');
+    await secrets.remove('tunnel-token');
+    await rm(path.join(state, 'tunnel-token.dpapi'), { force: true });
+  }
+  if (parts.includes('preferences')) { claudeAccounts.clearCache(); chatgptAccounts.clearCache(); }
+  db.compact();
+  // The proxy holds the Azure key in memory, so clearing it needs a restart;
+  // tunnel changes only need the public URL re-applied.
+  let lifecycleNote = '';
+  if (parts.includes('azure')) lifecycleNote = await queueLifecycle('restart');
+  else if (parts.includes('tunnel') || (parts.includes('preferences') && before.tunnelMode !== 'auto')) lifecycleNote = await queueLifecycle('tunnel');
+  return { message: `Cleared: ${parts.length} item${parts.length > 1 ? 's' : ''}.${lifecycleNote ? ` ${lifecycleNote}` : ''}` };
+});
+
 ipcMain.handle('azure:snapshot', async () => {
   const tunnel = await json('tunnel.json'), startStatus = await json('start-status.json'), config = await json('config.json'), result = await health();
   return {
@@ -227,11 +414,16 @@ ipcMain.handle('azure:snapshot', async () => {
     mode: tunnel?.mode || '',
     tunnelName: tunnel?.tunnelName || '',
     tunnel: startStatus?.tunnel || null,
+    tunnelNote: tunnel?.note || '',
+    tunnelConfig: await tunnelConfigInfo(),
+    appSettings: appSettings(db),
+    system: systemInfo(),
+    data: dataInfo(),
     models: modelRegistry(),
     codex: process.platform === 'win32' ? await codexSwitch.status().catch(error => ({ enabled: false, error: error.message })) : { enabled: false, error: 'Codex switching is currently available on Windows.' },
     codexRestart: await readFile(path.join(state, 'codex-restart-status.txt'), 'utf8').catch(() => ''),
-    claudeCli: claudeCliStatus(),
-    chatgpt: chatgptStatus(),
+    claudeCli: claudeAccounts.summary(),
+    chatgpt: chatgptAccounts.summary(),
     azureKey: await azureKeyInfo(),
     pricing: db.settingGet('pricing') || DEFAULT_PRICING,
     pricingIsDefault: !db.settingGet('pricing'),
@@ -334,6 +526,12 @@ ipcMain.handle('azure:request-detail', async (_e, id) => {
   return detail;
 });
 
+// The model that explains requests (Settings → Tools); any bridge model works.
+function analyzerModel() {
+  const ids = modelRegistry().map(m => m.id);
+  const chosen = appSettings(db).analyzerModel;
+  return ids.includes(chosen) ? chosen : ids[0];
+}
 ipcMain.handle('azure:analyze', async (_e, payload) => {
   const id = String(payload?.id || '');
   if (!/^[0-9a-f-]{36}$/.test(id)) throw Error('Invalid request id');
@@ -350,7 +548,7 @@ ipcMain.handle('azure:analyze', async (_e, payload) => {
     previews += line;
   }
   const prompt = `You are analyzing one LLM API request that passed through the owner's local proxy ("Azure Cursor Bridge"). The bridge is a pure pass-through: it stores no prompts upstream and caches nothing; "cached tokens" are Azure's own prompt-cache discount on repeated prefixes, not the bridge.\n\nExplain to the bridge owner, in plain language and under 200 words: which client sent this request, what made up the input (system prompt vs tool definitions vs conversation history vs tool results), why the input token count is the size it is, how much Azure served from its prompt cache, and 2-3 practical observations. Character counts are estimates (about 4 chars per token).\n\nRequest summary JSON:\n${JSON.stringify(summary)}\n\nMessage previews (truncated):\n${previews}`;
-  const response = await fetch(`http://127.0.0.1:${config.port || 17834}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}`, 'x-bridge-client': 'Bridge analyzer' }, body: JSON.stringify({ model: 'azure-astra', stream: false, reasoning_effort: 'low', messages: [{ role: 'user', content: prompt }] }), signal: AbortSignal.timeout(300000) });
+  const response = await fetch(`http://127.0.0.1:${config.port || 17834}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}`, 'x-bridge-client': 'Bridge analyzer' }, body: JSON.stringify({ model: analyzerModel(), stream: false, reasoning_effort: 'low', messages: [{ role: 'user', content: prompt }] }), signal: AbortSignal.timeout(300000) });
   const body = await response.json().catch(() => null);
   if (!response.ok) throw Error(body?.error?.message || `Analysis failed: HTTP ${response.status}`);
   const text = body?.choices?.[0]?.message?.content || '';
@@ -459,151 +657,195 @@ ipcMain.handle('azure:azure-key', async (_e, cmd) => {
   throw Error('Unknown Azure key action');
 });
 
-const claudeCliPath = path.join(os.homedir(), '.local', 'bin', process.platform === 'win32' ? 'claude.exe' : 'claude');
-// Saved Claude accounts (Team, personal…). 'default' is this computer's own
-// Claude Code login; the others each keep a separate login in their own CLI
-// config dir, and the proxy runs Claude models on whichever one is active.
-const CLAUDE_DEFAULT = { id: 'default', label: 'This computer' };
-const claudeSaved = () => (db.settingGet('claude-accounts') || []).filter(a => a && claudeAccountDir(state, a.id));
-const claudeAccounts = () => [CLAUDE_DEFAULT, ...claudeSaved()];
-function claudeActiveId() {
-  const id = db.settingGet('claude-account-active') || 'default';
-  return claudeAccounts().some(a => a.id === id) ? id : 'default';
-}
-function claudeEnv(id) {
-  const dir = claudeAccountDir(state, id);
-  return dir ? { ...process.env, CLAUDE_CONFIG_DIR: dir } : process.env;
-}
-// `claude auth status` is authoritative for each account. Cached and
-// refreshed off-thread; polled faster while a login terminal is open.
-const claudeAuthCache = new Map();
-function claudeAuth(id) {
-  let c = claudeAuthCache.get(id);
-  if (!c) claudeAuthCache.set(id, c = { at: 0, checked: false, checking: false, loggedIn: false, account: null, watchUntil: 0, watchFrom: '' });
-  const ttl = Date.now() < c.watchUntil ? 4000 : 30000;
-  if (existsSync(claudeCliPath) && Date.now() - c.at > ttl && !c.checking) {
-    c.checking = true;
-    import('node:child_process').then(({ execFile }) => {
-      execFile(claudeCliPath, ['auth', 'status'], { windowsHide: true, timeout: 15000, env: claudeEnv(id) }, (_err, stdout) => {
-        try {
-          const s = JSON.parse(String(stdout));
-          c.loggedIn = Boolean(s.loggedIn);
-          c.account = s.loggedIn ? { email: s.email || '', org: s.orgName || '', plan: s.subscriptionType || '', method: s.authMethod || '' } : null;
-          c.checked = true;
-          if (c.watchUntil && JSON.stringify(c.account) !== c.watchFrom) c.watchUntil = 0;
-        } catch {}
-        c.at = Date.now();
-        c.checking = false;
-      });
-    }).catch(() => { c.checking = false; });
-  }
-  return c;
-}
-function claudeCliStatus() {
-  const active = claudeActiveId();
-  const accounts = claudeAccounts().map(a => {
-    const c = claudeAuth(a.id);
-    return { id: a.id, label: a.label, active: a.id === active, checked: c.checked, loggedIn: c.loggedIn, account: c.account };
-  });
-  const current = accounts.find(a => a.active);
-  return { installed: existsSync(claudeCliPath), checked: current.checked, loggedIn: current.loggedIn, account: current.account, active, activeLabel: current.label, accounts };
-}
-async function openClaudeLogin(id) {
-  if (!existsSync(claudeCliPath)) throw Error('The Claude CLI is not installed. Install it from https://claude.ai/install.ps1 first.');
+// CLI locations: a path set in Settings → Tools wins, else auto-detected.
+const claudeExe = () => findClaudeCli(appSettings(db).claudeCliPath);
+const codexExe = () => codexCliPath(appSettings(db).codexCliPath);
+// Saved subscription accounts for the Claude CLI (Claude plans) and the Codex
+// CLI (ChatGPT plans). 'default' is this computer's own CLI login; every other
+// account keeps a separate login in its own folder under the state dir
+// (selected with the CLI's config-dir variable), so adding or switching never
+// signs Claude Code or the Codex app out. The proxy uses the active account.
+const execFileP = async (file, args, env) => {
+  const { execFile } = await import('node:child_process');
+  return new Promise(resolve => execFile(file, args, { windowsHide: true, timeout: 15000, env }, (err, stdout, stderr) => resolve({ err, stdout: String(stdout || ''), stderr: String(stderr || '') })));
+};
+async function openTerminal(title, bin, args, extraEnv) {
   const { spawn } = await import('node:child_process');
-  const dir = claudeAccountDir(state, id);
-  const env = claudeEnv(id);
+  const env = { ...process.env, ...extraEnv };
+  const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`;
   if (process.platform === 'win32') {
-    spawn('cmd.exe', ['/c', 'start', `Log in with Claude${dir ? ` (${id})` : ''}`, 'cmd', '/k', claudeCliPath, 'auth', 'login', '--claudeai'], { detached: true, windowsHide: false, env }).unref();
+    spawn('cmd.exe', ['/c', 'start', title, 'cmd', '/k', bin, ...args], { detached: true, windowsHide: false, env }).unref();
   } else if (process.platform === 'darwin') {
-    spawn('osascript', ['-e', `tell application "Terminal" to do script "${dir ? `CLAUDE_CONFIG_DIR='${dir}' ` : ''}'${claudeCliPath}' auth login --claudeai"`], { detached: true }).unref();
+    const command = [...Object.entries(extraEnv).map(([k, v]) => `${k}=${q(v)}`), ...[bin, ...args].map(q)].join(' ');
+    spawn('osascript', ['-e', `tell application "Terminal" to do script ${JSON.stringify(command)}`, '-e', 'tell application "Terminal" to activate'], { detached: true }).unref();
   } else {
-    spawn('x-terminal-emulator', ['-e', ...(dir ? ['env', `CLAUDE_CONFIG_DIR=${dir}`] : []), claudeCliPath, 'auth', 'login', '--claudeai'], { detached: true, env }).unref();
+    spawn('x-terminal-emulator', ['-e', 'env', ...Object.entries(extraEnv).map(([k, v]) => `${k}=${v}`), bin, ...args], { detached: true, env }).unref();
   }
-  const c = claudeAuth(id);
-  c.watchFrom = JSON.stringify(c.account);
-  c.watchUntil = Date.now() + 10 * 60000;
-  c.at = 0;
 }
+function createCliAccounts({ key, name, envVar, dirFor, exe, notFound, readStatus, loginArgs, logoutArgs }) {
+  const cache = new Map();
+  const saved = () => (db.settingGet(`${key}-accounts`) || []).filter(a => a && dirFor(a.id));
+  const all = () => [{ id: 'default', label: 'This computer' }, ...saved()];
+  const activeId = () => {
+    const id = db.settingGet(`${key}-account-active`) || 'default';
+    return all().some(a => a.id === id) ? id : 'default';
+  };
+  const extraEnv = id => (dirFor(id) ? { [envVar]: dirFor(id) } : {});
+  const found = () => { const bin = exe(); return bin && existsSync(bin) ? bin : null; };
+  // The CLI's own status command is authoritative. Cached and refreshed
+  // off-thread; polled faster while a login terminal is open.
+  function auth(id) {
+    let c = cache.get(id);
+    if (!c) cache.set(id, c = { at: 0, checked: false, checking: false, loggedIn: false, account: null, watchUntil: 0, watchFrom: '' });
+    const ttl = Date.now() < c.watchUntil ? 4000 : 30000;
+    const bin = found();
+    if (bin && Date.now() - c.at > ttl && !c.checking) {
+      c.checking = true;
+      readStatus(bin, { ...process.env, ...extraEnv(id) }, id).then(r => {
+        c.loggedIn = Boolean(r.loggedIn);
+        c.account = r.loggedIn ? r.account : null;
+        c.checked = true;
+        if (c.watchUntil && JSON.stringify(c.account) !== c.watchFrom) c.watchUntil = 0;
+      }).catch(() => {}).finally(() => { c.at = Date.now(); c.checking = false; });
+    }
+    return c;
+  }
+  function summary() {
+    const active = activeId();
+    const accounts = all().map(a => {
+      const c = auth(a.id);
+      return { id: a.id, label: a.label, active: a.id === active, checked: c.checked, loggedIn: c.loggedIn, account: c.account };
+    });
+    const current = accounts.find(a => a.active);
+    return { installed: Boolean(found()), checked: current.checked, loggedIn: current.loggedIn, account: current.account, active, activeLabel: current.label, accounts };
+  }
+  async function openLogin(id) {
+    const bin = found();
+    if (!bin) throw Error(notFound());
+    await openTerminal(`Log in with ${name}${dirFor(id) ? ` (${id})` : ''}`, bin, loginArgs, extraEnv(id));
+    const c = auth(id);
+    c.watchFrom = JSON.stringify(c.account);
+    c.watchUntil = Date.now() + 10 * 60000;
+    c.at = 0;
+  }
+  // Sign a saved (non-default) account out and delete its local login folder.
+  async function removeLogin(id) {
+    const dir = dirFor(id);
+    if (!dir) return;
+    const bin = found();
+    if (bin) await execFileP(bin, logoutArgs, { ...process.env, ...extraEnv(id) });
+    await rm(dir, { recursive: true, force: true });
+    cache.delete(id);
+  }
+  async function removeAll() {
+    for (const a of saved()) await removeLogin(a.id);
+    db.settingDelete(`${key}-accounts`);
+    db.settingDelete(`${key}-account-active`);
+  }
+  async function handle(request) {
+    const { action, id, label } = request || {};
+    const list = saved();
+    if (action === 'login-active') {
+      await openLogin(activeId());
+      return { message: `A terminal opened with the ${name} login — ${LOGIN_HINT} ${name} models work as soon as you are signed in.` };
+    }
+    if (action === 'add') {
+      if (!found()) throw Error(notFound());
+      // The panel names each plan from its signed-in account; this label is
+      // only the fallback until the login completes.
+      const label2 = String(label || '').trim().slice(0, 40) || `Plan ${list.length + 2}`;
+      const base = label2.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'plan';
+      let newId = base;
+      for (let n = 2; all().some(a => a.id === newId); n++) newId = `${base}-${n}`;
+      await mkdir(dirFor(newId), { recursive: true });
+      db.settingSet(`${key}-accounts`, [...list, { id: newId, label: label2 }]);
+      await openLogin(newId);
+      return { message: `A terminal opened to sign in to another ${name} plan — ${LOGIN_HINT} When you are signed in it appears under “Plan in use”; pick it there to switch.` };
+    }
+    const account = all().find(a => a.id === id);
+    if (!account) throw Error(`Unknown ${name} account`);
+    if (action === 'use') {
+      const c = auth(account.id);
+      if (!c.loggedIn) throw Error(`“${account.label}” is not signed in yet — press Log in on it first.`);
+      db.settingSet(`${key}-account-active`, account.id);
+      const who = [c.account?.email, c.account?.org, c.account?.plan && `${c.account.plan} plan`].filter(Boolean).join(' · ');
+      return { message: `${name} models now run on ${who || `“${account.label}”`} from the next request — no restart needed.` };
+    }
+    if (action === 'login') {
+      await openLogin(account.id);
+      return { message: `A terminal opened to sign in “${account.label}” — ${LOGIN_HINT}` };
+    }
+    if (action === 'remove') {
+      if (account.id === 'default') throw Error(`This computer’s own ${name} login cannot be removed here.`);
+      await removeLogin(account.id);
+      db.settingSet(`${key}-accounts`, list.filter(a => a.id !== account.id));
+      const wasActive = db.settingGet(`${key}-account-active`) === account.id;
+      if (wasActive) db.settingSet(`${key}-account-active`, 'default');
+      return { message: `Removed “${account.label}”.${wasActive ? ` ${name} models are back on this computer’s own login.` : ''}` };
+    }
+    throw Error(`Unknown ${name} account action`);
+  }
+  return { summary, handle, removeAll, clearCache: () => cache.clear() };
+}
+
+const CLAUDE_INSTALL = process.platform === 'win32'
+  ? 'Install it first: in PowerShell run  irm https://claude.ai/install.ps1 | iex'
+  : 'Install it first: in a terminal run  curl -fsSL https://claude.ai/install.sh | bash';
 const LOGIN_HINT = 'finish signing in there (it opens your browser; choose the account or organization you want).';
-ipcMain.handle('azure:claude-login', async () => {
-  await openClaudeLogin(claudeActiveId());
-  return { message: `A terminal opened with the Claude login — ${LOGIN_HINT} Claude CLI models work as soon as you are signed in.` };
+
+const claudeAccounts = createCliAccounts({
+  key: 'claude', name: 'Claude', envVar: 'CLAUDE_CONFIG_DIR',
+  dirFor: id => claudeAccountDir(state, id),
+  exe: claudeExe,
+  notFound: () => `The Claude CLI was not found. ${CLAUDE_INSTALL} — or set its location in Settings → Tools.`,
+  loginArgs: ['auth', 'login', '--claudeai'],
+  logoutArgs: ['auth', 'logout'],
+  readStatus: async (bin, env) => {
+    const s = JSON.parse((await execFileP(bin, ['auth', 'status'], env)).stdout);
+    return { loggedIn: s.loggedIn, account: { email: s.email || '', org: s.orgName || '', plan: s.subscriptionType || '', method: s.authMethod || '' } };
+  },
 });
-ipcMain.handle('azure:claude-account', async (_e, request) => {
-  const { action, id, label } = request || {};
-  const saved = claudeSaved();
-  if (action === 'add') {
-    if (!existsSync(claudeCliPath)) throw Error('The Claude CLI is not installed. Install it from https://claude.ai/install.ps1 first.');
-    const name =String(label || '').trim().slice(0, 40) || 'Personal';
-    const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'account';
-    let newId = base;
-    for (let n = 2; claudeAccounts().some(a => a.id === newId); n++) newId = `${base}-${n}`;
-    await mkdir(claudeAccountDir(state, newId), { recursive: true });
-    db.settingSet('claude-accounts', [...saved, { id: newId, label: name }]);
-    await openClaudeLogin(newId);
-    return { message: `A terminal opened to sign in “${name}” — ${LOGIN_HINT} Then press Use on it below.` };
-  }
-  const account = claudeAccounts().find(a => a.id === id);
-  if (!account) throw Error('Unknown Claude account');
-  if (action === 'use') {
-    const c = claudeAuth(account.id);
-    if (!c.loggedIn) throw Error(`“${account.label}” is not signed in yet — press Log in on it first.`);
-    db.settingSet('claude-account-active', account.id);
-    return { message: `Claude models now run on “${account.label}” (${c.account?.email || 'signed in'}) from the next request — no restart needed.` };
-  }
-  if (action === 'login') {
-    await openClaudeLogin(account.id);
-    return { message: `A terminal opened to sign in “${account.label}” — ${LOGIN_HINT}` };
-  }
-  if (action === 'remove') {
-    if (account.id === 'default') throw Error('This computer’s own Claude login cannot be removed here.');
-    const { execFile } = await import('node:child_process');
-    await new Promise(resolve => execFile(claudeCliPath, ['auth', 'logout'], { windowsHide: true, timeout: 15000, env: claudeEnv(account.id) }, () => resolve()));
-    await rm(claudeAccountDir(state, account.id), { recursive: true, force: true });
-    db.settingSet('claude-accounts', saved.filter(a => a.id !== account.id));
-    const wasActive = db.settingGet('claude-account-active') === account.id;
-    if (wasActive) db.settingSet('claude-account-active', 'default');
-    claudeAuthCache.delete(account.id);
-    return { message: `Removed “${account.label}”.${wasActive ? ' Claude models are back on this computer’s own login.' : ''}` };
-  }
-  throw Error('Unknown Claude account action');
-});
-// `codex login status` is authoritative; cached and refreshed off-thread.
-const chatgptAuthCache = { at: 0, loggedIn: false, method: '', checking: false };
-function chatgptStatus() {
-  const exe = codexCliPath();
-  if (exe && Date.now() - chatgptAuthCache.at > 30000 && !chatgptAuthCache.checking) {
-    chatgptAuthCache.checking = true;
-    import('node:child_process').then(({ execFile }) => {
-      execFile(exe, ['login', 'status'], { windowsHide: true, timeout: 15000 }, (err, stdout, stderr) => {
-        const out = `${stdout || ''}\n${stderr || ''}`;
-        chatgptAuthCache.loggedIn = !err && /logged in/i.test(out) && !/not logged in/i.test(out);
-        chatgptAuthCache.method = /chatgpt/i.test(out) ? 'chatgpt' : /api key/i.test(out) ? 'api-key' : '';
-        chatgptAuthCache.at = Date.now();
-        chatgptAuthCache.checking = false;
-      });
-    }).catch(() => { chatgptAuthCache.checking = false; });
-  }
-  return { installed: Boolean(exe), loggedIn: chatgptAuthCache.loggedIn, method: chatgptAuthCache.method };
+
+// Which ChatGPT account a Codex login belongs to: the email and plan claims
+// of the id_token in that login's auth.json. Tokens themselves are never
+// returned or shown.
+function codexAccountInfo(home) {
+  try {
+    const auth = JSON.parse(readFileSync(path.join(home, 'auth.json'), 'utf8'));
+    const idToken = auth?.tokens?.id_token;
+    const claims = typeof idToken === 'string' ? JSON.parse(Buffer.from(idToken.split('.')[1] || '', 'base64url').toString('utf8')) : {};
+    const openai = claims['https://api.openai.com/auth'] || {};
+    return { email: String(claims.email || ''), plan: String(openai.chatgpt_plan_type || ''), activeUntil: String(openai.chatgpt_subscription_active_until || '') };
+  } catch { return { email: '', plan: '', activeUntil: '' }; }
 }
-ipcMain.handle('azure:chatgpt-login', async () => {
-  const exe = codexCliPath();
-  if (!exe) throw Error('The Codex CLI was not found. Install the Codex app (or `npm i -g @openai/codex`) first.');
-  const { spawn } = await import('node:child_process');
-  if (process.platform === 'win32') {
-    spawn('cmd.exe', ['/c', 'start', 'Log in with ChatGPT', 'cmd', '/k', exe, 'login'], { detached: true, windowsHide: false }).unref();
-  } else if (process.platform === 'darwin') {
-    spawn('osascript', ['-e', `tell application "Terminal" to do script "'${exe}' login"`], { detached: true }).unref();
-  } else {
-    spawn('x-terminal-emulator', ['-e', `'${exe}' login`], { detached: true }).unref();
-  }
-  chatgptAuthCache.at = 0;
-  return { message: 'A terminal opened with the ChatGPT sign-in — finish it there (it opens your browser). ChatGPT plan models work as soon as you are signed in.' };
+const chatgptAccounts = createCliAccounts({
+  key: 'chatgpt', name: 'ChatGPT', envVar: 'CODEX_HOME',
+  dirFor: id => chatgptAccountDir(state, id),
+  exe: codexExe,
+  notFound: () => 'The Codex CLI was not found. Install the Codex app (or `npm i -g @openai/codex`) — or set its location in Settings → Tools.',
+  loginArgs: ['login'],
+  logoutArgs: ['logout'],
+  readStatus: async (bin, env, id) => {
+    const r = await execFileP(bin, ['login', 'status'], env);
+    const out = `${r.stdout}\n${r.stderr}`;
+    const loggedIn = !r.err && /logged in/i.test(out) && !/not logged in/i.test(out);
+    const method = /chatgpt/i.test(out) ? 'chatgpt' : /api key/i.test(out) ? 'api-key' : '';
+    const home = chatgptAccountDir(state, id) || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    return { loggedIn, account: { ...codexAccountInfo(home), method } };
+  },
 });
+
+ipcMain.handle('azure:claude-login', () => claudeAccounts.handle({ action: 'login-active' }));
+ipcMain.handle('azure:claude-account', (_e, request) => claudeAccounts.handle(request));
+ipcMain.handle('azure:chatgpt-login', () => chatgptAccounts.handle({ action: 'login-active' }));
+ipcMain.handle('azure:chatgpt-account', (_e, request) => chatgptAccounts.handle(request));
 ipcMain.handle('azure:action', async (_e, action) => {
   if (action === 'copy-key') { clipboard.writeText((await json('config.json')).apiKey); return 'Bridge key copied'; }
-  if (action === 'copy-url') { clipboard.writeText((await json('tunnel.json')).baseUrl); return 'URL copied'; }
+  if (action === 'copy-url') {
+    const publicBase = (await json('tunnel.json'))?.baseUrl;
+    clipboard.writeText(publicBase || `http://127.0.0.1:${(await json('config.json'))?.port || 17834}/v1`);
+    return publicBase ? 'URL copied' : 'Local URL copied (the public URL is off or not running)';
+  }
   if (action === 'start' || action === 'stop' || action === 'restart') return queueLifecycle(action);
   throw Error('Unknown action');
 });
@@ -622,6 +864,8 @@ if (!primaryInstance) {
     await ensureConfig();
     await secrets.migrateLegacy();
     db = openDb(state);
+    // Fresh install: start with the Claude and ChatGPT models (no Azure needed).
+    if (db.settingGet('custom-models') === null) db.settingSet('custom-models', DEFAULT_CUSTOM_MODELS.map(m => ({ ...m })));
     win = new BrowserWindow({ title: 'Azure Cursor Bridge', icon, width: 1120, height: 780, minWidth: 860, minHeight: 620, backgroundColor: '#111315', autoHideMenuBar: true, webPreferences: { preload: path.join(here, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
     await win.loadFile(path.join(here, 'renderer.html'));
     queueLifecycle('start').catch(error => win?.webContents.send('azure:lifecycle-error', error.message));

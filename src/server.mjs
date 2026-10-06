@@ -7,10 +7,12 @@ import { createSink, sendJson, sendOpenAIError, openSse } from './openai-protoco
 import { BridgeError } from './errors.mjs';
 import { MODELS, routeModel, runAzure } from './azure-adapter.mjs';
 import { runClaudeCli, activeClaudeConfigDir } from './claude-cli-adapter.mjs';
-import { runChatgptCli } from './chatgpt-cli-adapter.mjs';
+import { runChatgptCli, activeCodexHome } from './chatgpt-cli-adapter.mjs';
 import { settings, EFFORTS, resolveEffort, outputLimit, resolveServiceTier } from './model-settings.mjs';
 import { createTpmQueue } from './rate-limiter.mjs';
 import { openDb } from './db.mjs';
+import { appSettings } from './app-settings.mjs';
+import { trimBloat } from './bloat.mjs';
 
 function defaultStateDir() {
   if (process.env.CODEX_BRIDGE_STATE_DIR) return process.env.CODEX_BRIDGE_STATE_DIR;
@@ -110,6 +112,22 @@ function recordDetail(entry, body, req) {
 
 const countedEntries = new WeakSet();
 
+// 'deep' bloat removal: the summary is written by a bridge model through this
+// same bridge (owner key), marked so it is not trimmed itself.
+async function summarizeForTrim(prompt, model, signal) {
+  let ownerKey = config.apiKey;
+  try { ownerKey = JSON.parse((await readFile(path.join(stateDir, 'config.json'), 'utf8')).replace(/^﻿/, '')).apiKey; } catch {}
+  const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${ownerKey}`, 'content-type': 'application/json', 'x-bridge-client': 'Bloat remover', 'x-bridge-skip-trim': '1' },
+    body: JSON.stringify({ model, stream: false, reasoning_effort: 'low', messages: [{ role: 'user', content: prompt }] }),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(180000)]),
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw Error(j?.error?.message || `summary model returned HTTP ${r.status}`);
+  return j?.choices?.[0]?.message?.content || '';
+}
+
 // Keys are re-read on every request so a rotate, disable, reset or expiry
 // takes effect immediately without restarting the proxy.
 async function auth(req) {
@@ -157,7 +175,7 @@ const server = http.createServer(async (req, res) => {
     let preferences; try { preferences = settings(db.settingGet('model-settings') || {}); } catch { preferences = settings(); }
     const effort = resolveEffort(body, route, preferences);
     const serviceTier = ['responses', 'chat'].includes(route.protocol) ? resolveServiceTier(body, route, preferences) : null;
-    const estimatedInputTokens = Math.ceil(bytes / 4);
+    let estimatedInputTokens = Math.ceil(bytes / 4);
     entry = { effort, contextWindow: route.contextWindow, id: randomUUID(), at: new Date().toISOString(), model: route.id, deployment: route.deployment, protocol, bytes, status: 'running', client: clientLabel(req), via: req.headers['cf-connecting-ip'] ? 'public' : 'local', key: who.label, tierRequested: serviceTier };
     let started = Date.now();
     let ticket = null;
@@ -174,6 +192,24 @@ const server = http.createServer(async (req, res) => {
     const holdOpen = body.stream ? setTimeout(() => { if (!res.headersSent && !res.writableEnded) { openSse(res); res.write(': waiting for token budget\n\n'); } }, HOLD_OPEN_MS) : null;
     const heartbeat = setInterval(() => { if (res.headersSent && !res.writableEnded) res.write(': keepalive\n\n'); }, 15000);
     try {
+      // Bloat remover (Settings → Bloat remover): trims old tool output and
+      // history before the request is queued or sent upstream. A problem here
+      // never fails the request; it just goes through untrimmed.
+      const trimPrefs = appSettings(db);
+      if (trimPrefs.bloatLevel !== 'off' && !req.headers['x-bridge-skip-trim']) {
+        try {
+          const trimmed = await trimBloat(body, protocol, trimPrefs.bloatLevel, {
+            summarize: trimPrefs.bloatLevel === 'deep' ? prompt => summarizeForTrim(prompt, trimPrefs.bloatModel, abort.signal) : null,
+            cache: { get: k => db.summaryGet(k), set: (k, v) => db.summarySet(k, v) },
+          });
+          if (trimmed.stats) {
+            body = trimmed.body;
+            estimatedInputTokens = Math.max(1, estimatedInputTokens - Math.floor((trimmed.stats.beforeChars - trimmed.stats.afterChars) / 4));
+            const detail = db.getDetail(entry.id);
+            if (detail) db.saveDetail(entry.id, { ...detail, trim: trimmed.stats });
+          }
+        } catch {}
+      }
       // Models with a TPM budget wait here until their estimated tokens fit;
       // models without one pass straight through.
       ticket = await tpmQueue.acquire({
@@ -194,8 +230,8 @@ const server = http.createServer(async (req, res) => {
       started = Date.now();
       try { db.upsertRequest(entry); } catch {}
       const onThrottle = ms => { tpmQueue.pause(route.deployment, ms); if (route.tokensPerMinute > 0) { try { db.queueThrottle(route.id); } catch {} } };
-      if (route.protocol === 'claude-cli') await runClaudeCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir, configDir: activeClaudeConfigDir(db, stateDir) });
-      else if (route.protocol === 'chatgpt') await runChatgptCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir });
+      if (route.protocol === 'claude-cli') await runClaudeCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir, configDir: activeClaudeConfigDir(db, stateDir), cliPath: appSettings(db).claudeCliPath });
+      else if (route.protocol === 'chatgpt') await runChatgptCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir, cliPath: appSettings(db).codexCliPath, codexHome: activeCodexHome(db, stateDir) });
       else await runAzure({ body, protocol, route, key, endpoint, signal: abort.signal, sink, preferences, onThrottle, serviceTier });
     } finally { clearInterval(heartbeat); clearTimeout(holdOpen); }
   } catch (error) {

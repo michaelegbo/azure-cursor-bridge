@@ -231,6 +231,16 @@ function renderModelCards(models,modelSettings){
    sel.append(o);
   }
   sel.value=m.builtin?(modelSettings?.[m.id]?.effort||'medium'):(m.defaultEffort||'medium');
+  sel.addEventListener('change',()=>saveModelCard(m));
+  const saved=document.createElement('p');
+  saved.className='card-saved';
+  saved.id=`saved-${m.id}`;
+  saved.setAttribute('role','status');
+  const recent=cardNotes[m.id];
+  if(recent&&Date.now()-recent.at<6000)saved.textContent=recent.text;
+  const override=document.createElement('p');
+  override.className='card-note';
+  override.textContent=`Cursor uses this unless you pick an effort-suffixed name such as ${m.id}-high. Codex always sends its own reasoning choice, which takes precedence.`;
   const ctx=document.createElement('p');
   ctx.textContent=`Maximum context: ${(m.contextWindow||0).toLocaleString()} tokens`+(m.maxInputTokens?` (up to ${m.maxInputTokens.toLocaleString()} input)`:'');
   const out=document.createElement('p');
@@ -245,6 +255,7 @@ function renderModelCards(models,modelSettings){
    cb.type='checkbox';
    cb.id=`fast-${m.id}`;
    cb.checked=m.fast===true;
+   cb.addEventListener('change',()=>saveModelCard(m));
    const text=document.createElement('span');
    text.textContent='Fast mode — Azure priority processing: faster responses, billed at the fast-mode rate';
    fast.append(cb,text);
@@ -253,9 +264,26 @@ function renderModelCards(models,modelSettings){
    fast.className='fast-note';
    fast.textContent=m.protocol==='claude-cli'||m.protocol==='anthropic'||m.protocol==='chatgpt'?'Fast mode: not available for this model through the bridge':'Fast mode: Azure does not offer priority processing for this model yet';
   }
-  card.append(name,idCode,dep,label,sel,fast,ctx,out,tpm);
+  card.append(name,idCode,dep,label,sel,saved,override,fast,ctx,out,tpm);
   grid.append(card);
  }
+}
+// Reasoning mode and fast mode save the moment they change. Saving re-renders
+// the cards, so the confirmation is kept here for a few seconds.
+const cardNotes={};
+async function saveModelCard(m){
+ const sel=$(`effort-${m.id}`),fastCb=$(`fast-${m.id}`);
+ const note=text=>{cardNotes[m.id]={text,at:Date.now()};const el=$(`saved-${m.id}`);if(el)el.textContent=text;};
+ const fast=fastCb?fastCb.checked:m.fast===true;
+ note('Saving…');
+ try{
+  if(m.builtin)await window.azureBridge.saveSettings({[m.id]:{effort:sel.value,...(fastCb?{fast}:{})}});
+  else await window.azureBridge.models({action:'save',model:{id:m.id,label:m.label,deployment:m.deployment,protocol:m.protocol,contextWindow:m.contextWindow,maxOutputTokens:m.maxOutputTokens,tokensPerMinute:m.tokensPerMinute||0,defaultEffort:sel.value,fast}});
+  note(`Saved — ${sel.selectedOptions[0]?.textContent||sel.value} applies to the next request`);
+ }catch(err){
+  note(String(err?.message||err).replace(/^Error invoking remote method '[^']+': (Error: )?/,''));
+ }
+ await refresh();
 }
 let pricingModelsSig='';
 function renderPricingForm(models,pricing){
@@ -370,64 +398,102 @@ function renderPlayModels(models){
  if([...sel.options].some(o=>o.value===current))sel.value=current;
 }
 
-$('claude-login').addEventListener('click',async()=>{
- const button=$('claude-login');
- button.disabled=true;
- try{const r=await window.azureBridge.claudeLogin();$('claude-message').textContent=r.message;}
- catch(err){$('claude-message').textContent=cleanIpcError(err,'azure:claude-login');}
- finally{button.disabled=false;}
-});
-const claudePlan=a=>a&&a.plan?a.plan[0].toUpperCase()+a.plan.slice(1)+' plan':'';
-const claudeOrgPlan=a=>a?[a.org,claudePlan(a)].filter(Boolean).join(' · ')||'—':'—';
-async function claudeAccountAction(request){
- try{const r=await window.azureBridge.claudeAccount(request);$('claude-message').textContent=r.message;}
- catch(err){$('claude-message').textContent=cleanIpcError(err,'azure:claude-account');}
+// Claude and ChatGPT plans share one switcher: a list of the signed-in plans
+// (one is used at a time), plus sign in / log in again / remove.
+const planLabel=a=>a&&a.plan?a.plan[0].toUpperCase()+a.plan.slice(1)+' plan':'';
+const claudeOrgPlan=a=>a?[a.org,planLabel(a)].filter(Boolean).join(' · ')||'—':'—';
+const chatgptPlan=a=>{
+ if(!a)return '—';
+ if(a.method==='api-key')return 'API key (no ChatGPT plan)';
+ const until=a.activeUntil&&!Number.isNaN(Date.parse(a.activeUntil))?` · renews ${new Date(a.activeUntil).toLocaleDateString()}`:'';
+ return (planLabel(a)||'—')+until;
+};
+const ACCOUNT_KINDS={
+ claude:{name:'Claude',cli:'Claude Code',call:r=>window.azureBridge.claudeAccount(r),plan:claudeOrgPlan,via:a=>a.method&&a.method!=='claude.ai'?` · via ${a.method}`:''},
+ chatgpt:{name:'ChatGPT',cli:'Codex',call:r=>window.azureBridge.chatgptAccount(r),plan:chatgptPlan,via:()=>''},
+};
+async function accountAction(kind,request){
+ try{const r=await ACCOUNT_KINDS[kind].call(request);$(`${kind}-message`).textContent=r.message;}
+ catch(err){$(`${kind}-message`).textContent=String(err?.message||err).replace(/^Error invoking remote method '[^']+': (Error: )?/,'');}
  await refresh();
 }
-$('claude-add').addEventListener('click',async()=>{
- const button=$('claude-add');
- button.disabled=true;
- try{await claudeAccountAction({action:'add',label:$('claude-new-label').value});$('claude-new-label').value='';}
- finally{button.disabled=false;}
-});
-let claudeAccountsSig='';
-function renderClaudeAccounts(accounts){
- const sig=JSON.stringify(accounts||[]);
- if(sig===claudeAccountsSig)return;
- claudeAccountsSig=sig;
- const tbody=$('claude-accounts');
- tbody.replaceChildren();
- for(const a of accounts||[]){
-  const tr=document.createElement('tr');
-  const who=a.account?(a.account.email||'(email not reported)')+(a.account.method&&a.account.method!=='claude.ai'?` · via ${a.account.method}`:''):a.checked?'Not signed in':'Checking…';
-  for(const value of [a.label+(a.id==='default'?' (Claude Code login)':''),who,claudeOrgPlan(a.account)]){
-   const td=document.createElement('td');
-   td.textContent=value;
-   tr.append(td);
+function describePlan(kind,a){
+ const k=ACCOUNT_KINDS[kind];
+ const own=a.id==='default'?` (this computer’s ${k.cli} login)`:'';
+ if(!a.account)return a.id==='default'?`This computer’s ${k.cli} login — not signed in`:`${a.label} — not signed in`;
+ return `${k.plan(a.account)} — ${a.account.email||'signed in'}${own}`;
+}
+const accountState={};
+function renderAccountPanel(kind,s){
+ if(!s)return;
+ accountState[kind]=s;
+ const k=ACCOUNT_KINDS[kind];
+ const a=s.loggedIn&&s.account;
+ $(`${kind}-account`).textContent=a?(a.email||'(email not reported)')+k.via(a):s.checked?'not signed in':'checking…';
+ $(`${kind}-org`).textContent=k.plan(a);
+ $(`${kind}-login`).hidden=!s.installed||!s.checked||s.loggedIn;
+ const accounts=s.accounts||[];
+ const choices=accounts.filter(x=>x.loggedIn||x.active);
+ const pending=accounts.filter(x=>!x.loggedIn&&!x.active&&x.checked);
+ const sel=$(`${kind}-plan`);
+ if(document.activeElement!==sel){
+  const sig=JSON.stringify(choices.map(x=>[x.id,x.loggedIn,x.account]));
+  if(sel.dataset.sig!==sig){
+   sel.dataset.sig=sig;
+   sel.replaceChildren(...choices.map(x=>{const o=document.createElement('option');o.value=x.id;o.textContent=describePlan(kind,x);return o;}));
   }
-  const td=document.createElement('td');
-  const add=(text,onClick)=>{const b=document.createElement('button');b.className='mini';b.textContent=text;b.addEventListener('click',onClick);td.append(b);return b;};
-  if(a.active)add('In use',()=>{}).disabled=true;
-  else add('Use',()=>claudeAccountAction({action:'use',id:a.id}));
-  add(a.loggedIn?'Log in again':'Log in',()=>{
-   if(a.id==='default'&&a.loggedIn&&!confirm('Logging in again here also changes the account Claude Code itself uses on this computer. To keep a second account separate, use “Add another Claude account” instead. Continue?'))return;
-   claudeAccountAction({action:'login',id:a.id});
-  });
-  if(a.id!=='default')add('Remove',()=>{
-   if(confirm(`Remove the saved Claude account “${a.label}”? It is signed out and its login is deleted from this computer.`))claudeAccountAction({action:'remove',id:a.id});
-  });
-  tr.append(td);
-  tbody.append(tr);
+  sel.value=s.active;
+ }
+ sel.disabled=choices.length<2;
+ $(`${kind}-remove`).disabled=s.active==='default';
+ $(`${kind}-relogin`).disabled=!s.installed;
+ const box=$(`${kind}-pending`);
+ const psig=JSON.stringify(pending.map(x=>x.id));
+ if(box.dataset.sig!==psig){
+  box.dataset.sig=psig;
+  box.replaceChildren();
+  box.hidden=!pending.length;
+  if(pending.length){
+   box.append('Sign-in not finished: ');
+   for(const p of pending){
+    const name=document.createElement('b');
+    name.textContent=p.label;
+    const finish=document.createElement('button');
+    finish.className='mini';finish.textContent='Finish sign-in';
+    finish.addEventListener('click',()=>accountAction(kind,{action:'login',id:p.id}));
+    const drop=document.createElement('button');
+    drop.className='mini';drop.textContent='Remove';
+    drop.addEventListener('click',()=>accountAction(kind,{action:'remove',id:p.id}));
+    box.append(name,finish,drop,' ');
+   }
+  }
  }
 }
-
-$('chatgpt-login').addEventListener('click',async()=>{
- const button=$('chatgpt-login');
- button.disabled=true;
- try{const r=await window.azureBridge.chatgptLogin();$('chatgpt-message').textContent=r.message;}
- catch(err){$('chatgpt-message').textContent=cleanIpcError(err,'azure:chatgpt-login');}
- finally{button.disabled=false;}
-});
+for(const kind of Object.keys(ACCOUNT_KINDS)){
+ const k=ACCOUNT_KINDS[kind];
+ $(`${kind}-plan`).addEventListener('change',e=>{
+  const id=e.target.value;
+  e.target.blur();
+  if(id!==accountState[kind]?.active)accountAction(kind,{action:'use',id});
+ });
+ $(`${kind}-login`).addEventListener('click',()=>accountAction(kind,{action:'login-active'}));
+ $(`${kind}-add`).addEventListener('click',async()=>{
+  const button=$(`${kind}-add`);
+  button.disabled=true;
+  try{await accountAction(kind,{action:'add'});}finally{button.disabled=false;}
+ });
+ $(`${kind}-relogin`).addEventListener('click',()=>{
+  const s=accountState[kind];
+  if(!s)return;
+  if(s.active==='default'&&s.loggedIn&&!confirm(`Logging in again here also changes the account ${k.cli} itself uses on this computer. To add your other plan without changing that, use “Sign in to another plan” instead. Continue?`))return;
+  accountAction(kind,{action:'login',id:s.active});
+ });
+ $(`${kind}-remove`).addEventListener('click',()=>{
+  const s=accountState[kind];
+  if(!s||s.active==='default')return;
+  if(confirm(`Remove this ${k.name} plan from the bridge? It is signed out and its login is deleted from this computer, and the bridge goes back to this computer’s own ${k.cli} login.`))accountAction(kind,{action:'remove',id:s.active});
+ });
+}
 
 $('cm-save').addEventListener('click',async()=>{
  const button=$('cm-save');
@@ -470,6 +536,14 @@ function buildDetailRow(id){
  const meta=document.createElement('p');
  meta.textContent=`${d.client||'Unknown client'} · via ${d.via==='public'?'public URL (through Cloudflare)':'localhost'} · ${d.protocol} protocol · effort ${d.effort}`+(d.userAgent?` · UA: ${d.userAgent}`:'');
  wrap.append(meta);
+ if(d.trim){
+  const t=d.trim,saved=Math.max(0,t.beforeChars-t.afterChars);
+  const parts=[t.shortened&&`${t.shortened} shortened`,t.deduped&&`${t.deduped} duplicates removed`,t.cleaned&&`${t.cleaned} tidied`,t.imagesRemoved&&`${t.imagesRemoved} old images removed`,t.summarizedTurns&&`${t.summarizedTurns} early turns summarized${t.summaryCached?' (cached)':''}`,t.summaryError&&`summary failed: ${t.summaryError}`].filter(Boolean);
+  const line=document.createElement('p');
+  line.className='trim-line';
+  line.textContent=`Bloat remover (${t.level}): ${t.beforeChars.toLocaleString()} → ${t.afterChars.toLocaleString()} characters of conversation sent upstream (−${t.beforeChars?Math.round(saved/t.beforeChars*100):0}%, about ${Math.round(saved/4).toLocaleString()} tokens)${parts.length?' · '+parts.join(' · '):''}. The breakdown below shows what the client sent.`;
+  wrap.append(line);
+ }
  const u=d.result?.usage;
  if(u){
   const fresh=Math.max(0,(u.inputTokens||0)-(u.cachedTokens||0));
@@ -828,25 +902,30 @@ async function refresh(){
   renderModelCards(s.models,s.settings);
   renderCodexSwitch(s.codex,s.models);
   if(!codexPending&&s.codexRestart?.startsWith('Codex restart failed:'))$('codex-message').textContent=s.codexRestart;
-  if(s.chatgpt)$('chatgpt-status').textContent=s.chatgpt.installed?(s.chatgpt.loggedIn?(s.chatgpt.method==='api-key'?'Found · signed in with an API key — sign in with ChatGPT to use plan models':'Found · signed in with ChatGPT'):'Found · NOT signed in — ChatGPT plan models will fail until you log in'):'Codex CLI not found — install the Codex app';
+  if(s.chatgpt){
+   $('chatgpt-status').textContent=s.chatgpt.installed?(s.chatgpt.loggedIn?(s.chatgpt.account?.method==='api-key'?'Found · signed in with an API key — sign in with ChatGPT to use plan models':'Found · signed in with ChatGPT'):'Found · NOT signed in — ChatGPT plan models will fail until you log in'):'Codex CLI not found — install the Codex app';
+   renderAccountPanel('chatgpt',s.chatgpt);
+  }
   if(s.claudeCli){
    $('claude-cli-status').textContent=s.claudeCli.installed?(s.claudeCli.loggedIn?'Installed · logged in':'Installed · NOT logged in — Claude CLI models will fail until you log in'):'Not installed';
-   const a=s.claudeCli.loggedIn&&s.claudeCli.account;
-   $('claude-account').textContent=`${s.claudeCli.activeLabel||'This computer'} — `+(a?(a.email||'(email not reported)')+(a.method&&a.method!=='claude.ai'?` · via ${a.method}`:''):s.claudeCli.checked?'not signed in':'checking…');
-   $('claude-org').textContent=claudeOrgPlan(a);
-   $('claude-login').hidden=!s.claudeCli.installed||!s.claudeCli.checked||s.claudeCli.loggedIn;
-   renderClaudeAccounts(s.claudeCli.accounts);
+   renderAccountPanel('claude',s.claudeCli);
   }
   if(s.busy)$('status').textContent=s.busy==='restart'?'Restarting bridge…':s.busy==='stop'?'Stopping bridge…':'Starting bridge…';
   else $('status').textContent=s.running?'Bridge running':'Bridge stopped';
   $('status').className='status'+(s.running?' on':'');
   setLifecycleDisabled(Boolean(s.busy)||actionPending);
   setToggleState(s);
-  $('url').textContent=s.baseUrl||'Start the bridge to create an endpoint';
-  $('detail-public').textContent=s.baseUrl||'Tunnel not running';
+  const off=s.mode==='off';
+  $('url').textContent=off?(s.localUrl||'—'):(s.baseUrl||'Start the bridge to create an endpoint');
+  $('url-note').textContent=off?'The public URL is off (Settings → Public URL). This local URL works for Codex and OpenCode on this computer; Cursor needs a public URL.'
+   :s.mode==='named'?'This is a permanent URL — it stays the same across restarts and reboots. Use it as the OpenAI base URL override in Cursor and the provider base URL in Codex. Keep this computer on while using the bridge.'
+   :s.baseUrl?`This is a temporary public URL — it changes each time the bridge starts. Set up your own Cloudflare tunnel in Settings for a permanent one.${s.tunnelNote?` ${s.tunnelNote}`:''}`
+   :'Use this as the OpenAI base URL override in Cursor and the provider base URL in Codex. Keep this computer on while using the bridge.';
+  $('detail-public').textContent=s.baseUrl||(off?'Off':'Tunnel not running');
   $('detail-local').textContent=s.localUrl||'—';
-  $('detail-tunnel').textContent=s.baseUrl?(s.mode==='named'?`Named Cloudflare tunnel “${s.tunnelName||'azure-cursor-bridge'}” — permanent URL`:'Temporary quick tunnel — URL changes on restart'):'—';
-  if(!actionPending&&s.running&&s.tunnel?.ok===false)$('message').textContent=`Bridge is running locally. Tunnel failed: ${s.tunnel.error}`;
+  $('detail-tunnel').textContent=off?'Off — local only':s.baseUrl?(s.mode==='named'?`Your Cloudflare tunnel “${s.tunnelName||'azure-cursor-bridge'}” — permanent URL`:'Temporary public URL — changes on restart'):'—';
+  if(!actionPending&&s.running&&s.tunnel?.ok===false)$('message').textContent=`Bridge is running locally. Public URL failed: ${s.tunnel.error}`;
+  renderSettings(s);
   pricingCfg=s.pricing;
   lastModels=s.models||[];
   renderPricingForm(lastModels,s.pricing);
@@ -882,6 +961,112 @@ document.querySelectorAll('[data-action]').forEach(button=>button.addEventListen
   await refresh();
  }
 }));
+
+// ── Settings page ──
+// Form fields are filled from the bridge until the user edits them, so the
+// 2.5 s refresh never overwrites what is being typed.
+const editing=new Set();
+document.querySelectorAll('[data-page="settings"] input,[data-page="settings"] select').forEach(el=>{
+ if(el.name==='data-part')return;
+ el.addEventListener('input',()=>editing.add(el.id||el.name));
+ el.addEventListener('change',()=>editing.add(el.id||el.name));
+});
+const fill=(id,value)=>{if(!editing.has(id))$(id).value=value;};
+const fmtBytes=n=>n>=1048576?`${(n/1048576).toFixed(1)} MB`:`${Math.max(1,Math.round(n/1024))} KB`;
+const TUNNEL_LABELS={auto:'Automatic',named:'My Cloudflare tunnel',quick:'Temporary public URL',off:'Off'};
+let analyzerSig='',bloatModelSig='';
+function renderSettings(s){
+ const a=s.appSettings||{},t=s.tunnelConfig||{},sys=s.system||{},d=s.data||{};
+ if(!editing.has('tunnel-mode'))document.querySelectorAll('input[name="tunnel-mode"]').forEach(r=>{r.checked=r.value===(a.tunnelMode||'auto');});
+ $('tunnel-now').textContent=s.mode==='off'?'Off — local only':s.baseUrl?`${s.mode==='named'?'Your tunnel':'Temporary URL'} · ${s.baseUrl}`:(s.running?'Not connected':'Bridge stopped')+(s.tunnel?.error?` · ${s.tunnel.error}`:'');
+ fill('tunnel-hostname',t.hostname||'');
+ $('tunnel-token-state').value=t.hasToken?'Saved (encrypted)':'None';
+ if(!editing.has('tunnel-fallback'))$('tunnel-fallback').checked=a.tunnelFallback!==false;
+ $('tunnel-remove').disabled=!t.hostname&&!t.hasToken;
+ const port=(s.localUrl.match(/:(\d+)\//)||[])[1]||'17834';
+ $('tunnel-service').textContent=`localhost:${port}`;
+ $('sys-version').textContent=`${sys.version||'—'} · ${({win32:'Windows',darwin:'macOS',linux:'Linux'})[sys.platform]||sys.platform||''}`;
+ fill('srv-port',port);
+ $('srv-login-wrap').hidden=!sys.loginItemSupported;
+ if(!editing.has('srv-login'))$('srv-login').checked=Boolean(sys.openAtLogin);
+ const tool=(c,custom)=>c?.found?`${c.path}${c.custom?' (set in Settings)':' (found automatically)'}`:custom?`Not found at ${custom}`:'Not found — install it to use these models';
+ $('tool-claude').textContent=tool(sys.claudeCli,a.claudeCliPath);
+ $('tool-codex').textContent=tool(sys.codexCli,a.codexCliPath);
+ fill('set-claude-path',a.claudeCliPath||'');
+ fill('set-codex-path',a.codexCliPath||'');
+ const sig=JSON.stringify((s.models||[]).map(m=>m.id));
+ if(sig!==analyzerSig&&!editing.has('set-analyzer')){
+  analyzerSig=sig;
+  const sel=$('set-analyzer');
+  sel.replaceChildren(...(s.models||[]).map(m=>{const o=document.createElement('option');o.value=m.id;o.textContent=`${m.label||m.id} (${m.id})`;return o;}));
+ }
+ if(!editing.has('set-analyzer'))$('set-analyzer').value=a.analyzerModel||'azure-astra';
+ if(!editing.has('bloat-level'))document.querySelectorAll('input[name="bloat-level"]').forEach(r=>{r.checked=r.value===(a.bloatLevel||'off');});
+ if(sig!==bloatModelSig&&!editing.has('set-bloat-model')){
+  bloatModelSig=sig;
+  $('set-bloat-model').replaceChildren(...(s.models||[]).map(m=>{const o=document.createElement('option');o.value=m.id;o.textContent=`${m.label||m.id} (${m.id})`;return o;}));
+ }
+ if(!editing.has('set-bloat-model'))$('set-bloat-model').value=a.bloatModel||'bridge-claude-haiku';
+ $('data-file').textContent=d.file||'—';
+ $('data-size').textContent=d.bytes?fmtBytes(d.bytes):'—';
+ $('data-counts').textContent=`${(d.requests||0).toLocaleString()} requests · ${(d.breakdowns||0).toLocaleString()} breakdowns · ${(d.usageDays||0).toLocaleString()} days of usage · ${(d.guestKeys||0).toLocaleString()} guest keys`;
+ fill('set-history',a.requestHistoryLimit||500);
+ fill('set-breakdowns',a.breakdownLimit||60);
+}
+async function settingsCall(messageId,buttons,fn,clearIds){
+ buttons.forEach(b=>{$(b).disabled=true;});
+ $(messageId).textContent='Working…';
+ try{const r=await fn();$(messageId).textContent=r.message;(clearIds||[]).forEach(id=>editing.delete(id));}
+ catch(err){$(messageId).textContent=String(err?.message||err).replace(/^Error invoking remote method '[^']+': (Error: )?/,'');}
+ finally{buttons.forEach(b=>{$(b).disabled=false;});await refresh();}
+}
+$('tunnel-save').addEventListener('click',()=>{
+ const mode=document.querySelector('input[name="tunnel-mode"]:checked')?.value||'auto';
+ if(mode==='off'&&!confirm('Turn the public URL off? Cursor will not be able to reach the bridge until you turn it back on.'))return;
+ settingsCall('tunnel-message',['tunnel-save','tunnel-reconnect','tunnel-remove'],async()=>{
+  const r=await window.azureBridge.tunnel({action:'save',mode,hostname:$('tunnel-hostname').value,token:$('tunnel-token').value,fallback:$('tunnel-fallback').checked});
+  $('tunnel-token').value='';
+  return r;
+ },['tunnel-mode','tunnel-hostname','tunnel-token','tunnel-fallback']);
+});
+$('tunnel-reconnect').addEventListener('click',()=>settingsCall('tunnel-message',['tunnel-save','tunnel-reconnect','tunnel-remove'],()=>window.azureBridge.tunnel({action:'reconnect'})));
+$('tunnel-remove').addEventListener('click',()=>{
+ if(!confirm('Remove your Cloudflare tunnel hostname and token from this bridge? The bridge switches to a temporary public URL. The tunnel itself stays in your Cloudflare account.'))return;
+ settingsCall('tunnel-message',['tunnel-save','tunnel-reconnect','tunnel-remove'],()=>window.azureBridge.tunnel({action:'remove'}),['tunnel-mode','tunnel-hostname','tunnel-token']);
+});
+$('srv-port-save').addEventListener('click',()=>{
+ const port=Number($('srv-port').value);
+ if(!confirm(`Move the bridge to port ${port}? It restarts now, interrupting requests in progress.`))return;
+ settingsCall('srv-message',['srv-port-save'],()=>window.azureBridge.server({action:'port',port}),['srv-port']);
+});
+$('srv-login').addEventListener('change',()=>settingsCall('srv-message',[],()=>window.azureBridge.server({action:'login-item',enabled:$('srv-login').checked}),['srv-login']));
+$('tools-save').addEventListener('click',()=>settingsCall('tools-message',['tools-save'],()=>window.azureBridge.appSettings({claudeCliPath:$('set-claude-path').value,codexCliPath:$('set-codex-path').value,analyzerModel:$('set-analyzer').value}),['set-claude-path','set-codex-path','set-analyzer']));
+$('bloat-save').addEventListener('click',()=>settingsCall('bloat-message',['bloat-save'],()=>{
+ const patch={bloatLevel:document.querySelector('input[name="bloat-level"]:checked')?.value||'off'};
+ if($('set-bloat-model').value)patch.bloatModel=$('set-bloat-model').value;
+ return window.azureBridge.appSettings(patch);
+},['bloat-level','set-bloat-model']));
+$('history-save').addEventListener('click',()=>settingsCall('data-message',['history-save'],()=>window.azureBridge.appSettings({requestHistoryLimit:Number($('set-history').value),breakdownLimit:Number($('set-breakdowns').value)}),['set-history','set-breakdowns']));
+$('data-open').addEventListener('click',()=>settingsCall('data-message',[],()=>window.azureBridge.data({action:'open-folder'})));
+$('data-compact').addEventListener('click',()=>settingsCall('data-message',['data-compact'],()=>window.azureBridge.data({action:'compact'})));
+$('data-select-all').addEventListener('click',()=>{
+ const boxes=[...document.querySelectorAll('input[name="data-part"]')];
+ const all=boxes.every(b=>b.checked);
+ boxes.forEach(b=>{b.checked=!all;});
+ $('data-select-all').textContent=all?'Select everything':'Select none';
+});
+$('data-clear').addEventListener('click',()=>{
+ const boxes=[...document.querySelectorAll('input[name="data-part"]:checked')];
+ if(!boxes.length){$('data-message').textContent='Choose what to clear first.';return;}
+ const list=boxes.map(b=>`• ${b.parentElement.textContent.trim()}`).join('\n');
+ if(!confirm(`Clear these from this computer? This cannot be undone.\n\n${list}`))return;
+ settingsCall('data-message',['data-clear'],async()=>{
+  const r=await window.azureBridge.data({action:'clear',parts:boxes.map(b=>b.value)});
+  document.querySelectorAll('input[name="data-part"]').forEach(b=>{b.checked=false;});
+  $('data-select-all').textContent='Select everything';
+  return r;
+ },[...editing]);
+});
 
 window.azureBridge.onLifecycleError(message=>{
  $('message').textContent=`Automatic start failed: ${message}`;
@@ -967,28 +1152,3 @@ $('play-send').addEventListener('click',async()=>{
  }
 });
 
-$('save-settings').addEventListener('click',async()=>{
- const button=$('save-settings');
- button.disabled=true;
- try{
-  const builtins={};
-  for(const m of lastModels){
-   const sel=$(`effort-${m.id}`);
-   if(!sel)continue;
-   const fastCb=$(`fast-${m.id}`);
-   const fast=fastCb?fastCb.checked:m.fast===true;
-   if(m.builtin){
-    builtins[m.id]={effort:sel.value,...(fastCb?{fast}:{})};
-   }else if(sel.value!==(m.defaultEffort||'medium')||fast!==(m.fast===true)){
-    await window.azureBridge.models({action:'save',model:{id:m.id,label:m.label,deployment:m.deployment,protocol:m.protocol,contextWindow:m.contextWindow,maxOutputTokens:m.maxOutputTokens,tokensPerMinute:m.tokensPerMinute||0,defaultEffort:sel.value,fast}});
-   }
-  }
-  if(Object.keys(builtins).length)await window.azureBridge.saveSettings(builtins);
-  $('settings-message').textContent='Saved. These modes apply to the next request for each model.';
- }catch(error){
-  $('settings-message').textContent=cleanIpcError(error,'azure:models');
- }finally{
-  button.disabled=false;
-  await refresh();
- }
-});

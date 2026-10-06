@@ -90,6 +90,22 @@
   #nav button.active{background:#29333b;border-color:#50606d;color:#e8eef4}
   .page{display:none}
   .page.active{display:block}
+  .choice-list{display:grid;gap:8px;margin:14px 0}
+  .choice{display:flex;gap:10px;align-items:flex-start;margin:0;padding:10px 12px;border:1px solid #2f373e;border-radius:8px;cursor:pointer;color:#cdd6dd}
+  .choice:has(input:checked){border-color:#5b8dd9;background:#1b2229}
+  .choice input{margin-top:4px}
+  .check{display:flex;gap:8px;align-items:center;margin:8px 0;color:#cdd6dd;font-size:14px;cursor:pointer}
+  .check input{width:16px;height:16px;margin:0}
+  .check-grid{display:grid;grid-template-columns:1fr 1fr;gap:2px 16px;margin-top:8px}
+  @media(max-width:880px){.check-grid{grid-template-columns:1fr}}
+  button.danger{border-color:#8a4a40;color:#ffad9c}
+  button.danger:hover{background:#3a2622}
+  #tunnel-message,#srv-message,#tools-message,#data-message,#bloat-message{color:#a6d6f9}
+  .pending-plans{font-size:13px}
+  .pending-plans button{margin-left:6px}
+  .card-saved{font-size:12px;color:#8ae0b6;min-height:16px;margin:4px 0 0}
+  .card-note{font-size:12px;color:#8d99a5;margin:4px 0 0}
+  .trim-line{color:#8ae0b6 !important}
   #wizard{position:fixed;inset:0;background:rgba(10,12,14,.82);display:flex;align-items:center;justify-content:center;z-index:100}
   #wizard[hidden]{display:none}
   .wizard-card{background:#191d21;border:1px solid #3a444c;border-radius:12px;padding:30px;max-width:560px;width:92%;box-shadow:0 24px 60px rgba(0,0,0,.5)}
@@ -142,6 +158,7 @@
    <button data-page="azure">Azure</button>
    <button data-page="usage">Usage &amp; cost</button>
    <button data-page="requests">Requests</button>
+   <button data-page="settings">Settings</button>
    <button data-page="docs">Docs</button>
   </nav>
   <div class="page active" data-page="overview">
@@ -155,7 +172,7 @@
     <button data-action="restart">Restart bridge</button>
    </div>
    <div id="message" role="status"></div>
-   <p>This is a permanent URL — it stays the same across restarts and reboots. Use it as the OpenAI base URL override in Cursor and the provider base URL in Codex. Keep this computer on while using the bridge.</p>
+   <p id="url-note">Use this as the OpenAI base URL override in Cursor and the provider base URL in Codex. Keep this computer on while using the bridge.</p>
   </section>
   <section class="panel" aria-labelledby="codex-heading">
    <h2 id="codex-heading">Codex model source</h2>
@@ -169,10 +186,9 @@
   </section>
   <section class="models" id="model-cards"></section>
   <section class="panel">
-   <button id="save-settings">Save model settings</button>
-   <p id="settings-message" role="status">Changes apply to the next request. Higher effort can take longer and use more tokens.</p>
-   <p>These are defaults for bare model names. Clients can override per request — effort-suffixed models in Cursor (e.g. <code>azure-astra-high</code>), the reasoning selector in Codex. See “Control reasoning effort” under Endpoint details.</p>
-   <p>Full Azure context is available through the bridge. Cursor controls the history it sends and may compact earlier. No local truncation is applied.</p>
+   <p id="settings-message" role="status">Reasoning mode and fast mode save as soon as you change them and apply to the next request. Higher effort can take longer and use more tokens.</p>
+   <p>These are the defaults for bare model names. A client can still choose per request, and its choice wins: effort-suffixed names in Cursor (e.g. <code>bridge-claude-opus-max</code>), or Codex's own reasoning selector, which Codex always sends. See “Control reasoning effort” under Docs.</p>
+   <p>Full context is available through the bridge. To trim old tool output and history before it goes upstream, turn on the bloat remover in Settings.</p>
   </section>
   <section class="panel">
    <h2>Azure and custom models</h2>
@@ -194,18 +210,121 @@
    <h2>Claude account</h2>
    <p>Models on the <b>Claude CLI</b> protocol run locally through the Claude Code CLI using your Claude subscription — no Azure involved. Client tool calling (Cursor agent mode, Codex) is supported through structured tool-call emulation; Claude Code's own local tools stay fully disabled.</p>
    <div class="kv"><span>Claude CLI</span><code id="claude-cli-status">—</code></div>
-   <div class="kv"><span>Bridge uses</span><code id="claude-account">—</code></div>
+   <label for="claude-plan">Plan in use</label>
+   <select id="claude-plan" aria-describedby="claude-switch-note"></select>
+   <div class="kv"><span>Signed in as</span><code id="claude-account">—</code></div>
    <div class="kv"><span>Organization · plan</span><code id="claude-org">—</code></div>
-   <p>Keep several Claude accounts here (for example your Team plan and a personal Pro or Max plan) and switch which one the bridge's Claude models run on — the switch applies from the next request, no restart. <b>This computer</b> is the normal Claude Code login on this PC; every other account keeps its own separate login, so adding or switching accounts never signs Claude Code out.</p>
-   <div class="model-table-wrap"><table><thead><tr><th>Account</th><th>Signed in as</th><th>Organization · plan</th><th>Actions</th></tr></thead><tbody id="claude-accounts"></tbody></table></div>
-   <div class="model-form"><label>New account name<input id="claude-new-label" placeholder="Personal" maxlength="40"></label></div>
-   <div class="actions"><button id="claude-add">Add another Claude account</button><button id="claude-login" hidden>Log in with Claude</button><span id="claude-message" role="status"></span></div>
+   <p class="pending-plans" id="claude-pending" hidden></p>
+   <div class="actions"><button id="claude-add">Sign in to another plan</button><button id="claude-relogin" type="button">Log in again</button><button id="claude-remove" type="button" class="danger">Remove this plan</button><button id="claude-login" hidden>Log in with Claude</button><span id="claude-message" role="status"></span></div>
+   <p class="fast-note" id="claude-switch-note">One plan is used at a time. Your Team and personal plans are separate logins: use “Sign in to another plan” once and pick the other account or organization in the browser. After that, switching is one choice in the list above and applies from the next request. Switching never signs Claude Code out.</p>
   </section>
   <section class="panel">
    <h2>ChatGPT account</h2>
    <p>Models on the <b>ChatGPT plan</b> protocol run locally through the Codex CLI using your ChatGPT sign-in (Plus, Pro, Business…) — no Azure involved. Every Codex tool is switched off for bridge requests, so they can never run commands or read files on this computer; client tool calling (Cursor agent mode, Codex) works through the same emulation as Claude. Because a ChatGPT plan is personal, these models only accept the bridge <b>owner key</b>, not guest keys.</p>
    <div class="kv"><span>Codex CLI</span><code id="chatgpt-status">—</code></div>
-   <div class="actions"><button id="chatgpt-login">Log in with ChatGPT</button><span id="chatgpt-message" role="status"></span></div>
+   <label for="chatgpt-plan">Plan in use</label>
+   <select id="chatgpt-plan" aria-describedby="chatgpt-switch-note"></select>
+   <div class="kv"><span>Signed in as</span><code id="chatgpt-account">—</code></div>
+   <div class="kv"><span>Plan</span><code id="chatgpt-org">—</code></div>
+   <p class="pending-plans" id="chatgpt-pending" hidden></p>
+   <div class="actions"><button id="chatgpt-add">Sign in to another plan</button><button id="chatgpt-relogin" type="button">Log in again</button><button id="chatgpt-remove" type="button" class="danger">Remove this plan</button><button id="chatgpt-login" hidden>Log in with ChatGPT</button><span id="chatgpt-message" role="status"></span></div>
+   <p class="fast-note" id="chatgpt-switch-note">One plan is used at a time. To use another ChatGPT plan (for example a work Business plan next to your personal Pro plan), use “Sign in to another plan” once and pick that account or workspace in the browser. After that, switching is one choice in the list above and applies from the next request. Switching never signs the Codex app out.</p>
+  </section>
+  </div>
+  <div class="page" data-page="settings">
+  <section class="panel">
+   <h2>Public URL (Cloudflare)</h2>
+   <p>Cursor reaches the bridge from the internet, so the bridge publishes a public URL through Cloudflare. Choose how:</p>
+   <div class="choice-list" role="radiogroup" aria-label="Public URL">
+    <label class="choice"><input type="radio" name="tunnel-mode" value="auto"><span><b>Automatic</b> — your own Cloudflare tunnel when one is set up below, otherwise a temporary public URL.</span></label>
+    <label class="choice"><input type="radio" name="tunnel-mode" value="named"><span><b>My Cloudflare tunnel</b> — a permanent URL on your own domain that never changes.</span></label>
+    <label class="choice"><input type="radio" name="tunnel-mode" value="quick"><span><b>Temporary public URL</b> — free and needs no Cloudflare account, but the URL changes every time the bridge starts.</span></label>
+    <label class="choice"><input type="radio" name="tunnel-mode" value="off"><span><b>Off</b> — local only. Codex and OpenCode on this computer still work; Cursor needs a public URL.</span></label>
+   </div>
+   <div class="kv"><span>Now using</span><code id="tunnel-now">—</code></div>
+   <h3 class="subhead">Your Cloudflare tunnel</h3>
+   <details>
+    <summary>How to create one (free, about 5 minutes)</summary>
+    <ol>
+     <li>In the Cloudflare dashboard open <b>Zero Trust → Networks → Tunnels</b> and choose <b>Create a tunnel</b> → <b>Cloudflared</b>.</li>
+     <li>Name it, then copy the install command shown for any operating system. You can paste the whole command below; the bridge picks out the token.</li>
+     <li>Under <b>Public hostname</b>, add a hostname on a domain you manage in Cloudflare (for example <code>bridge.example.com</code>), service type <b>HTTP</b>, URL <code id="tunnel-service">localhost:17834</code>.</li>
+     <li>Enter the hostname and token below and save. There is nothing else to install: the bridge ships with cloudflared.</li>
+    </ol>
+   </details>
+   <div class="model-form">
+    <label>Public hostname<input id="tunnel-hostname" placeholder="bridge.example.com" maxlength="253" autocomplete="off"></label>
+    <label>Tunnel token<input id="tunnel-token" type="password" placeholder="Paste the token or install command" autocomplete="off"></label>
+    <label>Saved token<input id="tunnel-token-state" disabled></label>
+   </div>
+   <label class="check"><input type="checkbox" id="tunnel-fallback"> If my tunnel fails to connect, use a temporary public URL instead</label>
+   <div class="actions"><button id="tunnel-save">Save and apply</button><button id="tunnel-reconnect" type="button">Reconnect</button><button id="tunnel-remove" type="button" class="danger">Remove my tunnel</button><span id="tunnel-message" role="status"></span></div>
+   <p class="fast-note">A new hostname or token reconnects the public URL, which interrupts requests in flight through it. The token is stored encrypted with your operating system's keystore.</p>
+  </section>
+  <section class="panel">
+   <h2>Bridge</h2>
+   <div class="kv"><span>Version</span><code id="sys-version">—</code></div>
+   <div class="model-form">
+    <label>Local port<input id="srv-port" type="number" min="1024" max="65535"></label>
+   </div>
+   <div class="actions"><button id="srv-port-save">Change port</button><span id="srv-message" role="status"></span></div>
+   <label class="check" id="srv-login-wrap"><input type="checkbox" id="srv-login"> Start the bridge when I sign in to this computer</label>
+   <p class="fast-note">Changing the port restarts the bridge and its public URL, which interrupts requests in progress. The bridge keeps serving after you close this window.</p>
+  </section>
+  <section class="panel">
+   <h2>Tools</h2>
+   <p>Claude models run through the Claude Code CLI and ChatGPT-plan models through the Codex CLI. Both are found automatically; enter a location only if yours is installed somewhere unusual.</p>
+   <div class="kv"><span>Claude CLI</span><code id="tool-claude">—</code></div>
+   <div class="kv"><span>Codex CLI</span><code id="tool-codex">—</code></div>
+   <div class="model-form">
+    <label>Claude CLI location<input id="set-claude-path" placeholder="Automatic" autocomplete="off"></label>
+    <label>Codex CLI location<input id="set-codex-path" placeholder="Automatic" autocomplete="off"></label>
+    <label>Model that analyzes requests<select id="set-analyzer"></select></label>
+   </div>
+   <div class="actions"><button id="tools-save">Save</button><span id="tools-message" role="status"></span></div>
+  </section>
+  <section class="panel">
+   <h2>Bloat remover</h2>
+   <p>Cursor and Codex resend the whole conversation on every turn, and most of it is old tool output: file dumps, logs, repeated reads. The bloat remover trims what is older before it goes upstream, so requests use fewer tokens. It never touches the system prompt, the tool definitions or your newest turns, and if anything goes wrong the request simply goes through untrimmed.</p>
+   <div class="choice-list" role="radiogroup" aria-label="Bloat remover level">
+    <label class="choice"><input type="radio" name="bloat-level" value="off"><span><b>Off</b> — send conversations exactly as the client sent them.</span></label>
+    <label class="choice"><input type="radio" name="bloat-level" value="small"><span><b>Small</b> — tidy older tool output: colour codes, trailing spaces, runs of blank or repeated log lines, and exact duplicate results. Nothing meaningful is removed.</span></label>
+    <label class="choice"><input type="radio" name="bloat-level" value="medium"><span><b>Medium</b> — Small, plus tool results older than the last 6 turns are cut to 8,000 characters (start and end kept).</span></label>
+    <label class="choice"><input type="radio" name="bloat-level" value="high"><span><b>High</b> — the last 4 turns stay intact; older tool results are cut to 2,000 characters, older replies to 4,000, and old images are removed.</span></label>
+    <label class="choice"><input type="radio" name="bloat-level" value="aggressive"><span><b>Aggressive</b> — the last 3 turns stay intact; everything older is reduced to short previews.</span></label>
+    <label class="choice"><input type="radio" name="bloat-level" value="deep"><span><b>Deep</b> — Aggressive, plus an AI model writes a summary of the early conversation in blocks of 6 turns and it replaces them. Each block is summarized once and cached.</span></label>
+   </div>
+   <div class="model-form">
+    <label>Model that writes Deep summaries<select id="set-bloat-model"></select></label>
+   </div>
+   <div class="actions"><button id="bloat-save">Save</button><span id="bloat-message" role="status"></span></div>
+   <p class="fast-note">Higher levels save more tokens, but the model may lose details from earlier in the conversation. Each request's breakdown on the Requests page shows how much was removed. Summaries count as normal requests (client “Bloat remover”).</p>
+  </section>
+  <section class="panel">
+   <h2>Local database</h2>
+   <p>Everything the bridge records lives in one SQLite file on this computer. Nothing is stored anywhere else.</p>
+   <div class="kv"><span>Location</span><code id="data-file">—</code></div>
+   <div class="kv"><span>Size</span><code id="data-size">—</code></div>
+   <div class="kv"><span>Contents</span><code id="data-counts">—</code></div>
+   <div class="model-form">
+    <label>Requests to keep<input id="set-history" type="number" min="50" max="10000"></label>
+    <label>Request breakdowns to keep<input id="set-breakdowns" type="number" min="10" max="1000"></label>
+   </div>
+   <div class="actions"><button id="history-save">Save limits</button><button id="data-open" type="button">Open data folder</button><button id="data-compact" type="button">Compact database</button></div>
+   <h3 class="subhead">Clear or reset to defaults</h3>
+   <div class="check-grid">
+    <label class="check"><input type="checkbox" name="data-part" value="requests"> Request history and breakdowns</label>
+    <label class="check"><input type="checkbox" name="data-part" value="usage"> Usage, cost and queue history</label>
+    <label class="check"><input type="checkbox" name="data-part" value="preferences"> Model settings, pricing and preferences</label>
+    <label class="check"><input type="checkbox" name="data-part" value="models"> Custom models (back to the default Claude and ChatGPT models)</label>
+    <label class="check"><input type="checkbox" name="data-part" value="guestKeys"> Guest API keys</label>
+    <label class="check"><input type="checkbox" name="data-part" value="claudeAccounts"> Saved Claude accounts</label>
+    <label class="check"><input type="checkbox" name="data-part" value="chatgptAccounts"> Saved ChatGPT accounts</label>
+    <label class="check"><input type="checkbox" name="data-part" value="azure"> Azure endpoint and keys (all versions)</label>
+    <label class="check"><input type="checkbox" name="data-part" value="tunnel"> Cloudflare tunnel hostname and token</label>
+   </div>
+   <div class="actions"><button id="data-select-all" type="button">Select everything</button><button id="data-clear" type="button" class="danger">Clear selected</button><span id="data-message" role="status"></span></div>
+   <p class="fast-note">Your owner key is kept; rotate it under Access keys. Clearing Azure keys restarts the bridge, which interrupts requests in progress.</p>
   </section>
   </div>
   <div class="page" data-page="docs">
@@ -256,13 +375,13 @@
      <li><code>bridge-chatgpt-5-5</code> — GPT-5.5</li>
     </ol>
     <p><b>Effort</b> works like every bridge model (suffix such as <code>bridge-chatgpt-astra-high</code>, a client reasoning setting, or the model card default) and is passed to the model as its reasoning effort. GPT-5.5 tops out at xhigh, so max is lowered to xhigh for it.</p>
-    <p><b>Safety &amp; limits:</b> each request runs Codex with every tool switched off, a read-only sandbox, an empty working folder and without your Codex settings or MCP servers; if Codex ever tried to run a command, change a file or search the web, the run is stopped and the request fails. Replies arrive in one piece rather than streaming word by word. Usage counts against your ChatGPT plan's Codex limits. Sign in with Overview → ChatGPT account → “Log in with ChatGPT” (the same sign-in the Codex app uses).</p>
+    <p><b>Safety &amp; limits:</b> each request runs Codex with every tool switched off, a read-only sandbox, an empty working folder and without your Codex settings or MCP servers; if Codex ever tried to run a command, change a file or search the web, the run is stopped and the request fails. Replies arrive in one piece rather than streaming word by word. Usage counts against the Codex limits of the ChatGPT plan marked <b>In use</b> under Overview → ChatGPT account. That panel shows the signed-in email and plan; “Add another ChatGPT account” signs in a second account (for example a work Business plan next to a personal Pro plan) without touching the Codex app's own login, and <b>Use</b> switches the bridge to it from the next request.</p>
    </details>
    <details>
     <summary>Fast mode (priority processing)</summary>
     <p>Fast mode sends a request to Azure's <b>priority processing</b> tier (OpenAI calls it "fast mode"): lower latency and higher output speed, billed at a higher rate. On Azure it is currently offered for <b>GPT-6 Sol</b> (<code>azure-sol</code>) on Global or US Data Zone standard deployments — <b>not for GPT-6 Astra</b>, and not for the Claude models.</p>
     <ol>
-     <li><b>App toggle</b> — Overview → the model's card → <i>Fast mode</i>, then Save model settings. Applies to every request for that model.</li>
+     <li><b>App toggle</b> — Overview → the model's card → <i>Fast mode</i> (saves immediately). Applies to every request for that model.</li>
      <li><b>Client setting</b> — a client that sends its own <code>service_tier</code> wins over the toggle: <code>fast</code> or <code>priority</code> turns fast mode on for that request, <code>default</code> turns it off (Codex's fast toggle uses this). <code>flex</code> and <code>auto</code> are ignored because Azure rejects flex for these models.</li>
     </ol>
     <p>Azure may quietly serve a fast request at standard speed (and standard price) if traffic ramps up more than 50% within 15 minutes or during peak load. The Requests page shows what actually happened: <i>⚡ fast</i> or <i>fast requested, Azure served standard</i>. Cost estimates apply the <i>Fast mode ×</i> multiplier from Usage &amp; cost only to tokens Azure really served fast. Fast mode uses the same TPM quota as standard.</p>
@@ -295,8 +414,14 @@
     <p><b>Guest keys</b> are additional keys for the same endpoint with limits you control: an optional expiry set at creation, an on/off switch, Reset (new value, old one dies instantly), and Delete. The proxy re-checks keys on every request, so all changes are immediate — no restart needed. Each request in Recent requests shows which key authenticated it, with a per-key request counter in the table above.</p>
    </details>
    <details>
+    <summary>Bloat remover — trimming long conversations</summary>
+    <p>Settings → Bloat remover trims what Cursor and Codex resend on every turn before it goes upstream. <b>Small</b> only tidies older tool output (colour codes, blank and repeated lines, exact duplicates). <b>Medium</b>, <b>High</b> and <b>Aggressive</b> shorten tool results, replies and pasted text that are older than the last 6, 4 or 3 turns, keeping the start and end of each. <b>Deep</b> also has a model you choose summarize the early conversation, 6 turns at a time; each block is summarized once and cached, so later requests reuse it.</p>
+    <p>The system prompt, tool definitions and newest turns are never changed, and no tool call is separated from its result. Shortening older messages only changes the part of the prompt that was already old, so Azure's prompt cache keeps working for the rest. Each request's breakdown shows what was removed. If anything fails, the request goes through untrimmed.</p>
+   </details>
+   <details>
     <summary>How the endpoint works</summary>
-    <p>The bridge runs locally on port 17834 and translates OpenAI-style requests to your Azure deployments (<code>gpt-6-astra</code> and <code>claude-opus-5</code>). A named Cloudflare tunnel can publish it at a permanent hostname that survives restarts and reboots; the tunnel token is stored encrypted with the OS keystore. Without a named tunnel, the bridge uses a temporary trycloudflare URL that changes on every start.</p>
+    <p>The bridge runs locally (port 17834 by default, changeable in Settings) and translates OpenAI-style requests to your Azure deployments, your Claude subscription (Claude CLI) or your ChatGPT plan (Codex CLI). Cloudflare publishes it on the internet for Cursor: with your own Cloudflare tunnel at a permanent hostname, otherwise at a temporary trycloudflare URL that changes on every start. Choose between them, or turn the public URL off, in Settings → Public URL. The tunnel token is stored encrypted with the OS keystore.</p>
+    <p>All data stays in one local SQLite database. Settings → Local database shows where it is, how much history is kept, and lets you clear any part of it or reset it to defaults.</p>
    </details>
   </section>
   </div>
@@ -394,7 +519,8 @@
    <input id="wiz-endpoint" type="text" placeholder="https://your-resource.services.ai.azure.com" autocomplete="off">
    <label for="wiz-key">Azure API key</label>
    <input id="wiz-key" type="password" placeholder="Paste your Azure API key" autocomplete="off">
-   <p class="wizard-hint">Find both in the Azure portal under your Azure AI Foundry resource → Keys and Endpoint. The bridge needs deployments named <code>gpt-6-astra</code> and <code>claude-opus-5</code>.</p>
+   <p class="wizard-hint">Find both in the Azure portal under your Azure AI Foundry resource → Keys and Endpoint. The built-in Azure models expect deployments named <code>gpt-6-astra</code>, <code>gpt-6-sol</code> and <code>claude-opus-5</code>; add others under Overview → Azure and custom models.</p>
+   <p class="wizard-hint">No Azure? Choose “Configure later”. Claude and ChatGPT models only need a Claude or ChatGPT login (Overview), and a public URL is set up automatically.</p>
    <div class="actions">
     <button id="wiz-save">Save &amp; start</button>
     <button id="wiz-skip">Configure later</button>

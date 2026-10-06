@@ -1,5 +1,5 @@
 import { safeStorage } from 'electron';
-import { readFile, writeFile, readdir } from 'node:fs/promises';
+import { readFile, writeFile, readdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -20,6 +20,7 @@ export function createSecrets(stateDir) {
     } catch { return null; }
   }
   const has = name => existsSync(encPath(name));
+  async function remove(name) { await rm(encPath(name), { force: true }); }
 
   // Legacy migration: earlier Windows-only versions stored secrets as
   // PowerShell SecureString DPAPI blobs. Recover when a safeStorage file is
@@ -56,5 +57,5 @@ export function createSecrets(stateDir) {
     }
   }
 
-  return { set, get, has, migrateLegacy };
+  return { set, get, has, remove, migrateLegacy };
 }

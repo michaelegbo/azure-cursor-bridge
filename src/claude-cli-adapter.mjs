@@ -12,10 +12,19 @@ export const CLI_EFFORT_THINKING = { low: 0, medium: 4096, high: 16384, xhigh: 3
 const CALL_OPEN = '<<<TOOL_CALL>>>';
 const CALL_CLOSE = '<<<END_TOOL_CALL>>>';
 
-export function claudeCliPath() {
-  return path.join(os.homedir(), '.local', 'bin', process.platform === 'win32' ? 'claude.exe' : 'claude');
+// A path set in Settings wins; otherwise the native installer location, the
+// usual macOS package-manager folders (apps opened from Finder don't inherit
+// the shell PATH), then PATH. Returns the installer location when nothing is
+// found so "not installed" checks have a concrete path to report.
+export function claudeCliPath(override = '') {
+  if (override && existsSync(override)) return override;
+  const name = process.platform === 'win32' ? 'claude.exe' : 'claude';
+  const candidates = [path.join(os.homedir(), '.local', 'bin', name)];
+  if (process.platform === 'darwin') candidates.push('/opt/homebrew/bin/claude', '/usr/local/bin/claude');
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) if (dir) candidates.push(path.join(dir, name));
+  return candidates.find(p => existsSync(p)) || candidates[0];
 }
-export function claudeCliAvailable() { return existsSync(claudeCliPath()); }
+export function claudeCliAvailable(override = '') { return existsSync(claudeCliPath(override)); }
 
 // Saved Claude accounts. 'default' is this computer's normal Claude login;
 // every other account keeps its own login in its own CLI config dir under the
@@ -54,8 +63,9 @@ function toolInstructions(tools) {
 // prompt with a strict call format, calls are parsed out of the stream and
 // returned as OpenAI tool_calls, and tool results come back in the next
 // stateless request. Claude Code's own built-in tools stay fully disabled.
-export async function runClaudeCli({ body, protocol, route, effort, sink, signal, stateDir, configDir = null }) {
-  if (!claudeCliAvailable()) throw new BridgeError('The Claude CLI is not installed on the bridge machine.', 503);
+export async function runClaudeCli({ body, protocol, route, effort, sink, signal, stateDir, configDir = null, cliPath = '' }) {
+  const exe = claudeCliPath(cliPath);
+  if (!existsSync(exe)) throw new BridgeError('The Claude CLI is not installed on the bridge machine (or set its location in the bridge app → Settings → Tools).', 503);
   const base = protocol === 'chat' ? body : responsesToChat(body);
   const tools = (base.tools || []).filter(t => t.function?.name || t.name);
   const systemParts = [];
@@ -105,7 +115,7 @@ export async function runClaudeCli({ body, protocol, route, effort, sink, signal
   } else {
     cliEnv.MAX_THINKING_TOKENS = String(CLI_EFFORT_THINKING[effort] ?? 16384);
   }
-  const child = spawn(claudeCliPath(), args, {
+  const child = spawn(exe, args, {
     cwd: workDir,
     env: cliEnv,
     windowsHide: true,

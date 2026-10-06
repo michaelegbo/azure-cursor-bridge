@@ -24,7 +24,25 @@ const ALLOWED_ITEMS = new Set(['agent_message', 'reasoning', 'todo_list', 'error
 const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
 const MAX_EFFORT = { 'gpt-5.5': 'xhigh' };
 
-export function codexCliPath() {
+// Saved ChatGPT accounts, like the Claude ones: 'default' is this computer's
+// own Codex login (~/.codex); every other account keeps its own login in its
+// own CODEX_HOME under the bridge state dir, so the Codex app is never signed out.
+const ACCOUNT_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
+export function chatgptAccountDir(stateDir, id) {
+  return id && id !== 'default' && ACCOUNT_ID.test(id) ? path.join(stateDir, 'chatgpt-accounts', id) : null;
+}
+// The CODEX_HOME of the account the bridge app has selected (null = default).
+export function activeCodexHome(db, stateDir) {
+  let id = 'default';
+  try { id = db.settingGet('chatgpt-account-active') || 'default'; } catch {}
+  const dir = chatgptAccountDir(stateDir, id);
+  return dir && existsSync(dir) ? dir : null;
+}
+
+// A path set in Settings wins, then the env override, the Codex app's bundled
+// CLI, the usual macOS package-manager folders, and finally PATH.
+export function codexCliPath(override = '') {
+  if (override && existsSync(override)) return override;
   if (process.env.CODEX_BRIDGE_CODEX_PATH && existsSync(process.env.CODEX_BRIDGE_CODEX_PATH)) return process.env.CODEX_BRIDGE_CODEX_PATH;
   const found = [];
   if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
@@ -42,7 +60,8 @@ export function codexCliPath() {
   }
   if (found.length) return found.sort((a, b) => b.at - a.at)[0].exe;
   const name = process.platform === 'win32' ? 'codex.exe' : 'codex';
-  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+  const extra = process.platform === 'darwin' ? ['/opt/homebrew/bin', '/usr/local/bin'] : [];
+  for (const dir of [...extra, ...(process.env.PATH || '').split(path.delimiter)]) {
     const candidate = path.join(dir, name);
     if (dir && existsSync(candidate)) return candidate;
   }
@@ -171,9 +190,9 @@ export function codexArgs({ deployment, effort, workDir }) {
   ];
 }
 
-export async function runChatgptCli({ body, protocol, route, effort, sink, signal, stateDir }) {
-  const exe = codexCliPath();
-  if (!exe) throw new BridgeError('The Codex CLI is not installed on the bridge machine. Install the Codex app or `npm i -g @openai/codex`, then use “Log in with ChatGPT”.', 503);
+export async function runChatgptCli({ body, protocol, route, effort, sink, signal, stateDir, cliPath = '', codexHome = null }) {
+  const exe = codexCliPath(cliPath);
+  if (!exe) throw new BridgeError('The Codex CLI is not installed on the bridge machine. Install the Codex app or `npm i -g @openai/codex` (or set its location in the bridge app → Settings → Tools), then use “Log in with ChatGPT”.', 503);
   if (!/^[a-z0-9][a-z0-9.\-]{1,60}$/i.test(route.deployment)) throw new BridgeError('Invalid ChatGPT model name', 400);
   // An empty working folder, so even a misbehaving run has nothing to read.
   const workDir = path.join(stateDir, 'chatgpt-empty');
@@ -187,7 +206,7 @@ export async function runChatgptCli({ body, protocol, route, effort, sink, signa
     const built = buildPrompt(body, protocol, budget);
     specs = built.specs;
     try {
-      finalText = await runOnce(exe, built.prompt, { route, effort, workDir, sink, signal });
+      finalText = await runOnce(exe, built.prompt, { route, effort, workDir, sink, signal, codexHome });
       break;
     } catch (error) {
       if (attempt === 0 && error.tooLong && !signal?.aborted) { budget = Math.floor(budget * 0.6); continue; }
@@ -197,8 +216,10 @@ export async function runChatgptCli({ body, protocol, route, effort, sink, signa
   return deliver(finalText, specs, sink);
 }
 
-function runOnce(exe, prompt, { route, effort, workDir, sink, signal }) {
-  const child = spawn(exe, codexArgs({ deployment: route.deployment, effort, workDir }), { cwd: workDir, env: { ...process.env }, windowsHide: true });
+function runOnce(exe, prompt, { route, effort, workDir, sink, signal, codexHome }) {
+  const env = { ...process.env };
+  if (codexHome) env.CODEX_HOME = codexHome;
+  const child = spawn(exe, codexArgs({ deployment: route.deployment, effort, workDir }), { cwd: workDir, env, windowsHide: true });
   // Codex may exit before reading a large prompt; an unhandled EPIPE on stdin
   // would otherwise crash the whole proxy. The exit handler reports the error.
   child.stdin.on('error', () => {});
@@ -247,7 +268,7 @@ function runOnce(exe, prompt, { route, effort, workDir, sink, signal }) {
             return reject(err);
           }
           const auth = /not logged in|log ?in|401|unauthori[sz]ed|sign in|auth/i.test(problem);
-          return reject(new BridgeError(auth ? 'ChatGPT is not signed in on the bridge. Open the bridge app and use “Log in with ChatGPT”.' : String(problem).slice(0, 300), auth ? 503 : 502));
+          return reject(new BridgeError(auth ? `The ChatGPT account the bridge is set to use${codexHome ? ` (${path.basename(codexHome)})` : ''} is not signed in. Open the bridge app → ChatGPT account and log in, or switch to another account.` : String(problem).slice(0, 300), auth ? 503 : 502));
         }
         resolve(finalText);
       });

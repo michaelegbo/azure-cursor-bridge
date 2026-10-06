@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { normalizeAppSettings } from './app-settings.mjs';
 
 // Embedded SQLite storage shared by the Electron main process and the proxy
 // server child process. WAL mode allows both to read and write concurrently.
@@ -33,6 +34,7 @@ export function openDb(stateDir) {
       throttled INTEGER DEFAULT 0,
       PRIMARY KEY(day, model)
     );
+    CREATE TABLE IF NOT EXISTS trim_summaries(hash TEXT PRIMARY KEY, at TEXT, summary TEXT);
   `);
   try { db.exec(`ALTER TABLE guest_keys ADD COLUMN history TEXT`); } catch {}
   try { db.exec(`ALTER TABLE requests ADD COLUMN queue_ms INTEGER`); } catch {}
@@ -73,13 +75,26 @@ export function openDb(stateDir) {
     },
   });
 
+  // History caps come from Settings; re-read at most every 5 s.
+  let limitsCache = { at: 0, value: null };
+  const limits = () => {
+    if (Date.now() - limitsCache.at > 5000) {
+      let raw = null;
+      try { const row = db.prepare(`SELECT value FROM settings WHERE key='app-settings'`).get(); raw = row ? JSON.parse(row.value) : null; } catch {}
+      limitsCache = { at: Date.now(), value: normalizeAppSettings(raw || {}) };
+    }
+    return limitsCache.value;
+  };
+  const pruneRequests = () => db.prepare(`DELETE FROM requests WHERE id NOT IN (SELECT id FROM requests ORDER BY at DESC LIMIT ?)`).run(limits().requestHistoryLimit);
+  const pruneDetails = () => db.prepare(`DELETE FROM request_details WHERE id NOT IN (SELECT id FROM request_details ORDER BY at DESC LIMIT ?)`).run(limits().breakdownLimit);
+
   const api = {
     upsertRequest(entry) {
       const r = requestToRow(entry);
       db.prepare(`INSERT INTO requests(id,at,model,deployment,protocol,effort,bytes,status,client,via,key_label,duration_ms,input_tokens,cached_tokens,output_tokens,error,context_window,queue_ms,queue_jumped,tier_requested,tier_served)
         VALUES(:id,:at,:model,:deployment,:protocol,:effort,:bytes,:status,:client,:via,:key_label,:duration_ms,:input_tokens,:cached_tokens,:output_tokens,:error,:context_window,:queue_ms,:queue_jumped,:tier_requested,:tier_served)
         ON CONFLICT(id) DO UPDATE SET status=:status,duration_ms=:duration_ms,input_tokens=:input_tokens,cached_tokens=:cached_tokens,output_tokens=:output_tokens,error=:error,queue_ms=:queue_ms,queue_jumped=:queue_jumped,tier_served=:tier_served`).run(r);
-      db.prepare(`DELETE FROM requests WHERE id NOT IN (SELECT id FROM requests ORDER BY at DESC LIMIT 500)`).run();
+      pruneRequests();
     },
     listRequests(limit = 100) {
       return db.prepare(`SELECT * FROM requests ORDER BY at DESC LIMIT ?`).all(limit).map(rowToRequest);
@@ -87,7 +102,7 @@ export function openDb(stateDir) {
     saveDetail(id, detail) {
       db.prepare(`INSERT INTO request_details(id,at,json) VALUES(?,?,?)
         ON CONFLICT(id) DO UPDATE SET json=excluded.json`).run(id, detail.at || new Date().toISOString(), JSON.stringify(detail));
-      db.prepare(`DELETE FROM request_details WHERE id NOT IN (SELECT id FROM request_details ORDER BY at DESC LIMIT 60)`).run();
+      pruneDetails();
     },
     getDetail(id) {
       const row = db.prepare(`SELECT json FROM request_details WHERE id=?`).get(id);
@@ -174,6 +189,29 @@ export function openDb(stateDir) {
       }
       return [...byDay.values()];
     },
+    // Local data management (Settings → Local database).
+    stats() {
+      const count = sql => db.prepare(sql).get().c || 0;
+      return {
+        requests: count(`SELECT COUNT(*) c FROM requests`),
+        breakdowns: count(`SELECT COUNT(*) c FROM request_details`),
+        usageDays: count(`SELECT COUNT(DISTINCT day) c FROM usage_daily`),
+        guestKeys: count(`SELECT COUNT(*) c FROM guest_keys`),
+      };
+    },
+    applyHistoryLimits() { limitsCache.at = 0; pruneRequests(); pruneDetails(); },
+    clearRequests() { db.exec(`DELETE FROM requests; DELETE FROM request_details; DELETE FROM trim_summaries;`); },
+    // Bloat remover 'deep' summaries, keyed by a hash of the summarized span.
+    summaryGet(hash) { return db.prepare(`SELECT summary FROM trim_summaries WHERE hash=?`).get(hash)?.summary || null; },
+    summarySet(hash, summary) {
+      db.prepare(`INSERT INTO trim_summaries(hash,at,summary) VALUES(?,?,?) ON CONFLICT(hash) DO UPDATE SET at=excluded.at`).run(hash, new Date().toISOString(), summary);
+      db.prepare(`DELETE FROM trim_summaries WHERE hash NOT IN (SELECT hash FROM trim_summaries ORDER BY at DESC LIMIT 200)`).run();
+    },
+    clearUsage() { db.exec(`DELETE FROM usage_daily; DELETE FROM queue_daily;`); },
+    clearGuestKeys() { db.exec(`DELETE FROM guest_keys;`); },
+    settingDelete(key) { db.prepare(`DELETE FROM settings WHERE key=?`).run(key); limitsCache.at = 0; },
+    // Give freed pages back to the disk; skipped quietly if the proxy is busy writing.
+    compact() { try { db.exec(`PRAGMA wal_checkpoint(TRUNCATE); VACUUM;`); return true; } catch { return false; } },
     close() { db.close(); },
   };
 
