@@ -48,7 +48,9 @@ async function ensureConfig() {
 
 // Windows only: keep the MSIX-virtualized shadow copy of the state dir in sync
 // so a bridge launched under an MSIX app context sees the same credentials.
-const mirrorState = process.platform === 'win32' ? path.join(process.env.LOCALAPPDATA, 'Packages', 'OpenAI.Codex_2p2nqsd0c76g0', 'LocalCache', 'Local', 'CodexCursorProxy') : null;
+// Only for the real state dir: an app started on another one (tests, a second
+// profile) must never overwrite the real bridge's shadow copy.
+const mirrorState = process.platform === 'win32' && !process.env.CODEX_BRIDGE_STATE_DIR ? path.join(process.env.LOCALAPPDATA, 'Packages', 'OpenAI.Codex_2p2nqsd0c76g0', 'LocalCache', 'Local', 'CodexCursorProxy') : null;
 async function mirrorWrite(name, text) {
   if (!mirrorState || !existsSync(mirrorState)) return;
   try { await writeFile(path.join(mirrorState, name), text); } catch {}
