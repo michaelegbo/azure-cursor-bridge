@@ -42,7 +42,10 @@ async function azureEndpoint() {
 const CUSTOM_ID = /^[a-z0-9][a-z0-9-]{1,39}$/;
 function registry() {
   const saved = settings(db.settingGet('model-settings') || {});
-  const builtins = MODELS.map(m => ({ ...m, ...saved[m.id], defaultEffort: saved[m.id].effort, builtin: true }));
+  // Built-in models the owner removed (Overview → Azure and custom models).
+  let hidden = [];
+  try { hidden = db.settingGet('hidden-builtins') || []; } catch {}
+  const builtins = MODELS.filter(m => !hidden.includes(m.id)).map(m => ({ ...m, ...saved[m.id], defaultEffort: saved[m.id].effort, builtin: true }));
   const taken = new Set(builtins.flatMap(m => [m.id, m.deployment]));
   let custom = [];
   try { custom = db.settingGet('custom-models') || []; } catch {}

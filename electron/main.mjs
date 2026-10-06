@@ -135,9 +135,12 @@ function aggregatePeriods() {
 
 const CUSTOM_MODEL_ID = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/;
+// Built-in models the owner removed; the proxy filters the same list.
+const hiddenBuiltins = () => (db.settingGet('hidden-builtins') || []).filter(id => MODELS.some(m => m.id === id));
 function modelRegistry() {
   const saved = settings(db.settingGet('model-settings') || {});
-  const builtins = MODELS.map(m => ({ ...m, ...saved[m.id], defaultEffort: saved[m.id].effort, builtin: true, fastSupported: FAST_SUPPORTED.has(m.id) }));
+  const hidden = hiddenBuiltins();
+  const builtins = MODELS.filter(m => !hidden.includes(m.id)).map(m => ({ ...m, ...saved[m.id], defaultEffort: saved[m.id].effort, builtin: true, fastSupported: FAST_SUPPORTED.has(m.id) }));
   const taken = new Set(builtins.flatMap(m => [m.id, m.deployment]));
   const custom = (db.settingGet('custom-models') || []).filter(m => m && !taken.has(m.id));
   return [...builtins, ...custom.map(m => ({ ...m, builtin: false, fast: m.fast === true, fastSupported: ['responses', 'chat'].includes(m.protocol) }))];
@@ -158,8 +161,17 @@ ipcMain.handle('azure:models', async (_e, cmd) => {
     db.settingSet('model-settings', validated);
     return { message: `Model “${id}” settings saved — they apply to the next request.` };
   }
+  if (action === 'restore-builtins') {
+    const restored = hiddenBuiltins();
+    db.settingDelete('hidden-builtins');
+    return { message: restored.length ? `Restored ${restored.join(', ')}.` : 'All built-in models are already listed.' };
+  }
   if (action === 'delete') {
     const id = String(cmd.id || '');
+    if (MODELS.some(m => m.id === id)) {
+      db.settingSet('hidden-builtins', [...new Set([...hiddenBuiltins(), id])]);
+      return { message: `Built-in model “${id}” removed. Requests to it now fail closed; “Restore built-in models” brings it back.` };
+    }
     if (!custom.some(m => m.id === id)) throw Error('Model not found');
     db.settingSet('custom-models', custom.filter(m => m.id !== id));
     return { message: `Model “${id}” removed. Requests to it now fail closed.` };
@@ -375,7 +387,10 @@ ipcMain.handle('azure:data', async (_e, cmd) => {
   if (parts.includes('requests')) db.clearRequests();
   if (parts.includes('usage')) db.clearUsage();
   if (parts.includes('preferences')) for (const k of ['model-settings', 'pricing', 'app-settings']) db.settingDelete(k);
-  if (parts.includes('models')) db.settingSet('custom-models', DEFAULT_CUSTOM_MODELS.map(m => ({ ...m })));
+  if (parts.includes('models')) {
+    db.settingSet('custom-models', DEFAULT_CUSTOM_MODELS.map(m => ({ ...m })));
+    db.settingDelete('hidden-builtins');
+  }
   if (parts.includes('guestKeys')) db.clearGuestKeys();
   if (parts.includes('claudeAccounts')) await claudeAccounts.removeAll();
   if (parts.includes('chatgptAccounts')) await chatgptAccounts.removeAll();
@@ -429,6 +444,7 @@ ipcMain.handle('azure:snapshot', async () => {
     azureKey: await azureKeyInfo(),
     pricing: db.settingGet('pricing') || DEFAULT_PRICING,
     pricingIsDefault: !db.settingGet('pricing'),
+    hiddenBuiltins: hiddenBuiltins(),
     usageTotals: aggregatePeriods(),
     usageDays: db.usageDaily(30),
     queueLive: await liveQueue(),
@@ -499,7 +515,7 @@ ipcMain.handle('azure:test', async (_e, payload) => {
   const config = await json('config.json');
   if (!config?.apiKey) throw Error('Bridge is not installed.');
   const known = new Set(modelRegistry().map(m => m.id));
-  const model = known.has(payload?.model) ? payload.model : 'azure-astra';
+  const model = known.has(payload?.model) ? payload.model : [...known][0];
   const prompt = String(payload?.prompt || '').trim().slice(0, 4000);
   if (!prompt) throw Error('Enter a prompt to test.');
   let base = `http://127.0.0.1:${config.port || 17834}/v1`;
@@ -530,9 +546,11 @@ ipcMain.handle('azure:request-detail', async (_e, id) => {
 
 // The model that explains requests (Settings → Tools); any bridge model works.
 function analyzerModel() {
-  const ids = modelRegistry().map(m => m.id);
+  const models = modelRegistry();
   const chosen = appSettings(db).analyzerModel;
-  return ids.includes(chosen) ? chosen : ids[0];
+  if (models.some(m => m.id === chosen)) return chosen;
+  // Fall back to a subscription model (no Azure needed), then anything.
+  return (models.find(m => m.protocol === 'claude-cli') || models[0])?.id;
 }
 ipcMain.handle('azure:analyze', async (_e, payload) => {
   const id = String(payload?.id || '');

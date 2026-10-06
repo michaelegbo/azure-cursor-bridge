@@ -204,6 +204,7 @@
     <label>Tokens per minute (0 = off)<input id="cm-tpm" type="number" min="0" max="100000000" step="1" value="0"></label>
     <label>Default effort<select id="cm-effort"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option><option value="xhigh">Extra High</option><option value="max">Max</option></select></label>
    </div>
+   <p class="pending-plans" id="cm-hidden" hidden>Removed built-in models: <b id="cm-hidden-list"></b> <button class="mini" id="cm-restore" type="button">Restore built-in models</button></p>
    <div class="actions"><button id="cm-save">Add / update model</button><button id="cm-cancel" type="button" hidden>Cancel edit</button><span id="cm-message" role="status"></span></div>
   </section>
   <section class="panel">
@@ -316,7 +317,7 @@
     <label class="check"><input type="checkbox" name="data-part" value="requests"> Request history and breakdowns</label>
     <label class="check"><input type="checkbox" name="data-part" value="usage"> Usage, cost and queue history</label>
     <label class="check"><input type="checkbox" name="data-part" value="preferences"> Model settings, pricing and preferences</label>
-    <label class="check"><input type="checkbox" name="data-part" value="models"> Custom models (back to the default Claude and ChatGPT models)</label>
+    <label class="check"><input type="checkbox" name="data-part" value="models"> Models (back to the defaults: built-in Azure models plus the Claude and ChatGPT models)</label>
     <label class="check"><input type="checkbox" name="data-part" value="guestKeys"> Guest API keys</label>
     <label class="check"><input type="checkbox" name="data-part" value="claudeAccounts"> Saved Claude accounts</label>
     <label class="check"><input type="checkbox" name="data-part" value="chatgptAccounts"> Saved ChatGPT accounts</label>

@@ -364,22 +364,30 @@ function renderCustomModels(models){
   eb.textContent='Edit';
   eb.addEventListener('click',()=>editModel(m));
   td.append(eb);
-  if(!m.builtin){
-   const rb=document.createElement('button');
-   rb.className='mini';
-   rb.textContent='Remove';
-   rb.addEventListener('click',async()=>{
-    if(!confirm(`Remove model “${m.id}”? Requests to it will fail closed.`))return;
-    try{const r=await window.azureBridge.models({action:'delete',id:m.id});$('cm-message').textContent=r.message;}
-    catch(err){$('cm-message').textContent=cleanIpcError(err,'azure:models');}
-    await refresh();
-   });
-   td.append(rb);
-  }
+  const rb=document.createElement('button');
+  rb.className='mini';
+  rb.textContent='Remove';
+  rb.addEventListener('click',async()=>{
+   if(!confirm(m.builtin?`Remove the built-in model “${m.id}”? Requests to it will fail closed. You can bring it back with “Restore built-in models”.`:`Remove model “${m.id}”? Requests to it will fail closed.`))return;
+   try{const r=await window.azureBridge.models({action:'delete',id:m.id});$('cm-message').textContent=r.message;}
+   catch(err){$('cm-message').textContent=cleanIpcError(err,'azure:models');}
+   await refresh();
+  });
+  td.append(rb);
   tr.append(td);
   tbody.append(tr);
  }
 }
+function renderHiddenBuiltins(hidden){
+ const box=$('cm-hidden');
+ box.hidden=!(hidden||[]).length;
+ $('cm-hidden-list').textContent=(hidden||[]).join(', ');
+}
+$('cm-restore').addEventListener('click',async()=>{
+ try{const r=await window.azureBridge.models({action:'restore-builtins'});$('cm-message').textContent=r.message;}
+ catch(err){$('cm-message').textContent=cleanIpcError(err,'azure:models');}
+ await refresh();
+});
 
 let playModelsSig='';
 function renderPlayModels(models){
@@ -930,6 +938,7 @@ async function refresh(){
   lastModels=s.models||[];
   renderPricingForm(lastModels,s.pricing);
   renderCustomModels(lastModels);
+  renderHiddenBuiltins(s.hiddenBuiltins);
   renderPlayModels(lastModels);
   if(s.pricingIsDefault&&!$('price-message').textContent)$('price-message').textContent='Prefilled with Azure short-context list prices (Global Standard, Sep 2026). Long-context requests can cost more; verify against your agreement before saving.';
   renderAzureKey(s.azureKey);
