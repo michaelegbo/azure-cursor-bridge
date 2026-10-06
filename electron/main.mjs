@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, clipboard } from 'electron';
-import { appendFile, readFile, writeFile, mkdir } from 'node:fs/promises';
+import { appendFile, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,6 +24,7 @@ const codexSwitch = createCodexSwitch({ stateDir: state, assetsDir: here });
 const { settings, EFFORTS, FAST_SUPPORTED } = await import(pathToFileURL(path.join(bridgeRoot, 'src/model-settings.mjs')).href);
 const { MODELS } = await import(pathToFileURL(path.join(bridgeRoot, 'src/azure-adapter.mjs')).href);
 const { codexCliPath } = await import(pathToFileURL(path.join(bridgeRoot, 'src/chatgpt-cli-adapter.mjs')).href);
+const { claudeAccountDir } = await import(pathToFileURL(path.join(bridgeRoot, 'src/claude-cli-adapter.mjs')).href);
 const { openDb } = await import(pathToFileURL(path.join(bridgeRoot, 'src/db.mjs')).href);
 
 let win;
@@ -459,34 +460,114 @@ ipcMain.handle('azure:azure-key', async (_e, cmd) => {
 });
 
 const claudeCliPath = path.join(os.homedir(), '.local', 'bin', process.platform === 'win32' ? 'claude.exe' : 'claude');
-// `claude auth status` is authoritative (the CLI keeps its login in the OS
-// credential store, not in a readable file). Cached and refreshed off-thread.
-const claudeAuthCache = { at: 0, loggedIn: false, checking: false };
-function claudeCliStatus() {
-  const installed = existsSync(claudeCliPath);
-  if (installed && Date.now() - claudeAuthCache.at > 30000 && !claudeAuthCache.checking) {
-    claudeAuthCache.checking = true;
-    import('node:child_process').then(({ execFile }) => {
-      execFile(claudeCliPath, ['auth', 'status'], { windowsHide: true, timeout: 15000 }, (_err, stdout) => {
-        try { claudeAuthCache.loggedIn = Boolean(JSON.parse(String(stdout)).loggedIn); } catch {}
-        claudeAuthCache.at = Date.now();
-        claudeAuthCache.checking = false;
-      });
-    }).catch(() => { claudeAuthCache.checking = false; });
-  }
-  return { installed, loggedIn: claudeAuthCache.loggedIn };
+// Saved Claude accounts (Team, personal…). 'default' is this computer's own
+// Claude Code login; the others each keep a separate login in their own CLI
+// config dir, and the proxy runs Claude models on whichever one is active.
+const CLAUDE_DEFAULT = { id: 'default', label: 'This computer' };
+const claudeSaved = () => (db.settingGet('claude-accounts') || []).filter(a => a && claudeAccountDir(state, a.id));
+const claudeAccounts = () => [CLAUDE_DEFAULT, ...claudeSaved()];
+function claudeActiveId() {
+  const id = db.settingGet('claude-account-active') || 'default';
+  return claudeAccounts().some(a => a.id === id) ? id : 'default';
 }
-ipcMain.handle('azure:claude-login', async () => {
+function claudeEnv(id) {
+  const dir = claudeAccountDir(state, id);
+  return dir ? { ...process.env, CLAUDE_CONFIG_DIR: dir } : process.env;
+}
+// `claude auth status` is authoritative for each account. Cached and
+// refreshed off-thread; polled faster while a login terminal is open.
+const claudeAuthCache = new Map();
+function claudeAuth(id) {
+  let c = claudeAuthCache.get(id);
+  if (!c) claudeAuthCache.set(id, c = { at: 0, checked: false, checking: false, loggedIn: false, account: null, watchUntil: 0, watchFrom: '' });
+  const ttl = Date.now() < c.watchUntil ? 4000 : 30000;
+  if (existsSync(claudeCliPath) && Date.now() - c.at > ttl && !c.checking) {
+    c.checking = true;
+    import('node:child_process').then(({ execFile }) => {
+      execFile(claudeCliPath, ['auth', 'status'], { windowsHide: true, timeout: 15000, env: claudeEnv(id) }, (_err, stdout) => {
+        try {
+          const s = JSON.parse(String(stdout));
+          c.loggedIn = Boolean(s.loggedIn);
+          c.account = s.loggedIn ? { email: s.email || '', org: s.orgName || '', plan: s.subscriptionType || '', method: s.authMethod || '' } : null;
+          c.checked = true;
+          if (c.watchUntil && JSON.stringify(c.account) !== c.watchFrom) c.watchUntil = 0;
+        } catch {}
+        c.at = Date.now();
+        c.checking = false;
+      });
+    }).catch(() => { c.checking = false; });
+  }
+  return c;
+}
+function claudeCliStatus() {
+  const active = claudeActiveId();
+  const accounts = claudeAccounts().map(a => {
+    const c = claudeAuth(a.id);
+    return { id: a.id, label: a.label, active: a.id === active, checked: c.checked, loggedIn: c.loggedIn, account: c.account };
+  });
+  const current = accounts.find(a => a.active);
+  return { installed: existsSync(claudeCliPath), checked: current.checked, loggedIn: current.loggedIn, account: current.account, active, activeLabel: current.label, accounts };
+}
+async function openClaudeLogin(id) {
   if (!existsSync(claudeCliPath)) throw Error('The Claude CLI is not installed. Install it from https://claude.ai/install.ps1 first.');
   const { spawn } = await import('node:child_process');
+  const dir = claudeAccountDir(state, id);
+  const env = claudeEnv(id);
   if (process.platform === 'win32') {
-    spawn('cmd.exe', ['/c', 'start', 'Log in with Claude', 'cmd', '/k', claudeCliPath, '/login'], { detached: true, windowsHide: false }).unref();
+    spawn('cmd.exe', ['/c', 'start', `Log in with Claude${dir ? ` (${id})` : ''}`, 'cmd', '/k', claudeCliPath, 'auth', 'login', '--claudeai'], { detached: true, windowsHide: false, env }).unref();
   } else if (process.platform === 'darwin') {
-    spawn('osascript', ['-e', `tell application "Terminal" to do script "${claudeCliPath} /login"`], { detached: true }).unref();
+    spawn('osascript', ['-e', `tell application "Terminal" to do script "${dir ? `CLAUDE_CONFIG_DIR='${dir}' ` : ''}'${claudeCliPath}' auth login --claudeai"`], { detached: true }).unref();
   } else {
-    spawn('x-terminal-emulator', ['-e', `${claudeCliPath} /login`], { detached: true }).unref();
+    spawn('x-terminal-emulator', ['-e', ...(dir ? ['env', `CLAUDE_CONFIG_DIR=${dir}`] : []), claudeCliPath, 'auth', 'login', '--claudeai'], { detached: true, env }).unref();
   }
-  return { message: 'A terminal opened with the Claude login — finish signing in there (it opens your browser), then Claude CLI models work immediately.' };
+  const c = claudeAuth(id);
+  c.watchFrom = JSON.stringify(c.account);
+  c.watchUntil = Date.now() + 10 * 60000;
+  c.at = 0;
+}
+const LOGIN_HINT = 'finish signing in there (it opens your browser; choose the account or organization you want).';
+ipcMain.handle('azure:claude-login', async () => {
+  await openClaudeLogin(claudeActiveId());
+  return { message: `A terminal opened with the Claude login — ${LOGIN_HINT} Claude CLI models work as soon as you are signed in.` };
+});
+ipcMain.handle('azure:claude-account', async (_e, request) => {
+  const { action, id, label } = request || {};
+  const saved = claudeSaved();
+  if (action === 'add') {
+    if (!existsSync(claudeCliPath)) throw Error('The Claude CLI is not installed. Install it from https://claude.ai/install.ps1 first.');
+    const name =String(label || '').trim().slice(0, 40) || 'Personal';
+    const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'account';
+    let newId = base;
+    for (let n = 2; claudeAccounts().some(a => a.id === newId); n++) newId = `${base}-${n}`;
+    await mkdir(claudeAccountDir(state, newId), { recursive: true });
+    db.settingSet('claude-accounts', [...saved, { id: newId, label: name }]);
+    await openClaudeLogin(newId);
+    return { message: `A terminal opened to sign in “${name}” — ${LOGIN_HINT} Then press Use on it below.` };
+  }
+  const account = claudeAccounts().find(a => a.id === id);
+  if (!account) throw Error('Unknown Claude account');
+  if (action === 'use') {
+    const c = claudeAuth(account.id);
+    if (!c.loggedIn) throw Error(`“${account.label}” is not signed in yet — press Log in on it first.`);
+    db.settingSet('claude-account-active', account.id);
+    return { message: `Claude models now run on “${account.label}” (${c.account?.email || 'signed in'}) from the next request — no restart needed.` };
+  }
+  if (action === 'login') {
+    await openClaudeLogin(account.id);
+    return { message: `A terminal opened to sign in “${account.label}” — ${LOGIN_HINT}` };
+  }
+  if (action === 'remove') {
+    if (account.id === 'default') throw Error('This computer’s own Claude login cannot be removed here.');
+    const { execFile } = await import('node:child_process');
+    await new Promise(resolve => execFile(claudeCliPath, ['auth', 'logout'], { windowsHide: true, timeout: 15000, env: claudeEnv(account.id) }, () => resolve()));
+    await rm(claudeAccountDir(state, account.id), { recursive: true, force: true });
+    db.settingSet('claude-accounts', saved.filter(a => a.id !== account.id));
+    const wasActive = db.settingGet('claude-account-active') === account.id;
+    if (wasActive) db.settingSet('claude-account-active', 'default');
+    claudeAuthCache.delete(account.id);
+    return { message: `Removed “${account.label}”.${wasActive ? ' Claude models are back on this computer’s own login.' : ''}` };
+  }
+  throw Error('Unknown Claude account action');
 });
 // `codex login status` is authoritative; cached and refreshed off-thread.
 const chatgptAuthCache = { at: 0, loggedIn: false, method: '', checking: false };

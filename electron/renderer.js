@@ -377,6 +377,49 @@ $('claude-login').addEventListener('click',async()=>{
  catch(err){$('claude-message').textContent=cleanIpcError(err,'azure:claude-login');}
  finally{button.disabled=false;}
 });
+const claudePlan=a=>a&&a.plan?a.plan[0].toUpperCase()+a.plan.slice(1)+' plan':'';
+const claudeOrgPlan=a=>a?[a.org,claudePlan(a)].filter(Boolean).join(' · ')||'—':'—';
+async function claudeAccountAction(request){
+ try{const r=await window.azureBridge.claudeAccount(request);$('claude-message').textContent=r.message;}
+ catch(err){$('claude-message').textContent=cleanIpcError(err,'azure:claude-account');}
+ await refresh();
+}
+$('claude-add').addEventListener('click',async()=>{
+ const button=$('claude-add');
+ button.disabled=true;
+ try{await claudeAccountAction({action:'add',label:$('claude-new-label').value});$('claude-new-label').value='';}
+ finally{button.disabled=false;}
+});
+let claudeAccountsSig='';
+function renderClaudeAccounts(accounts){
+ const sig=JSON.stringify(accounts||[]);
+ if(sig===claudeAccountsSig)return;
+ claudeAccountsSig=sig;
+ const tbody=$('claude-accounts');
+ tbody.replaceChildren();
+ for(const a of accounts||[]){
+  const tr=document.createElement('tr');
+  const who=a.account?(a.account.email||'(email not reported)')+(a.account.method&&a.account.method!=='claude.ai'?` · via ${a.account.method}`:''):a.checked?'Not signed in':'Checking…';
+  for(const value of [a.label+(a.id==='default'?' (Claude Code login)':''),who,claudeOrgPlan(a.account)]){
+   const td=document.createElement('td');
+   td.textContent=value;
+   tr.append(td);
+  }
+  const td=document.createElement('td');
+  const add=(text,onClick)=>{const b=document.createElement('button');b.className='mini';b.textContent=text;b.addEventListener('click',onClick);td.append(b);return b;};
+  if(a.active)add('In use',()=>{}).disabled=true;
+  else add('Use',()=>claudeAccountAction({action:'use',id:a.id}));
+  add(a.loggedIn?'Log in again':'Log in',()=>{
+   if(a.id==='default'&&a.loggedIn&&!confirm('Logging in again here also changes the account Claude Code itself uses on this computer. To keep a second account separate, use “Add another Claude account” instead. Continue?'))return;
+   claudeAccountAction({action:'login',id:a.id});
+  });
+  if(a.id!=='default')add('Remove',()=>{
+   if(confirm(`Remove the saved Claude account “${a.label}”? It is signed out and its login is deleted from this computer.`))claudeAccountAction({action:'remove',id:a.id});
+  });
+  tr.append(td);
+  tbody.append(tr);
+ }
+}
 
 $('chatgpt-login').addEventListener('click',async()=>{
  const button=$('chatgpt-login');
@@ -786,7 +829,14 @@ async function refresh(){
   renderCodexSwitch(s.codex,s.models);
   if(!codexPending&&s.codexRestart?.startsWith('Codex restart failed:'))$('codex-message').textContent=s.codexRestart;
   if(s.chatgpt)$('chatgpt-status').textContent=s.chatgpt.installed?(s.chatgpt.loggedIn?(s.chatgpt.method==='api-key'?'Found · signed in with an API key — sign in with ChatGPT to use plan models':'Found · signed in with ChatGPT'):'Found · NOT signed in — ChatGPT plan models will fail until you log in'):'Codex CLI not found — install the Codex app';
-  if(s.claudeCli)$('claude-cli-status').textContent=s.claudeCli.installed?(s.claudeCli.loggedIn?'Installed · logged in':'Installed · NOT logged in — Claude CLI models will fail until you log in'):'Not installed';
+  if(s.claudeCli){
+   $('claude-cli-status').textContent=s.claudeCli.installed?(s.claudeCli.loggedIn?'Installed · logged in':'Installed · NOT logged in — Claude CLI models will fail until you log in'):'Not installed';
+   const a=s.claudeCli.loggedIn&&s.claudeCli.account;
+   $('claude-account').textContent=`${s.claudeCli.activeLabel||'This computer'} — `+(a?(a.email||'(email not reported)')+(a.method&&a.method!=='claude.ai'?` · via ${a.method}`:''):s.claudeCli.checked?'not signed in':'checking…');
+   $('claude-org').textContent=claudeOrgPlan(a);
+   $('claude-login').hidden=!s.claudeCli.installed||!s.claudeCli.checked||s.claudeCli.loggedIn;
+   renderClaudeAccounts(s.claudeCli.accounts);
+  }
   if(s.busy)$('status').textContent=s.busy==='restart'?'Restarting bridge…':s.busy==='stop'?'Stopping bridge…':'Starting bridge…';
   else $('status').textContent=s.running?'Bridge running':'Bridge stopped';
   $('status').className='status'+(s.running?' on':'');

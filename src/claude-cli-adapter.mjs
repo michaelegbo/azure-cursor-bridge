@@ -17,6 +17,21 @@ export function claudeCliPath() {
 }
 export function claudeCliAvailable() { return existsSync(claudeCliPath()); }
 
+// Saved Claude accounts. 'default' is this computer's normal Claude login;
+// every other account keeps its own login in its own CLI config dir under the
+// bridge state dir, so switching accounts never signs Claude Code itself out.
+export const CLAUDE_ACCOUNT_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
+export function claudeAccountDir(stateDir, id) {
+  return id && id !== 'default' && CLAUDE_ACCOUNT_ID.test(id) ? path.join(stateDir, 'claude-accounts', id) : null;
+}
+// The config dir of the account the bridge app has selected (null = default).
+export function activeClaudeConfigDir(db, stateDir) {
+  let id = 'default';
+  try { id = db.settingGet('claude-account-active') || 'default'; } catch {}
+  const dir = claudeAccountDir(stateDir, id);
+  return dir && existsSync(dir) ? dir : null;
+}
+
 const text = c => typeof c === 'string' ? c : (c || []).map(p => p.text || '').filter(Boolean).join('\n');
 
 function toolInstructions(tools) {
@@ -39,7 +54,7 @@ function toolInstructions(tools) {
 // prompt with a strict call format, calls are parsed out of the stream and
 // returned as OpenAI tool_calls, and tool results come back in the next
 // stateless request. Claude Code's own built-in tools stay fully disabled.
-export async function runClaudeCli({ body, protocol, route, effort, sink, signal, stateDir }) {
+export async function runClaudeCli({ body, protocol, route, effort, sink, signal, stateDir, configDir = null }) {
   if (!claudeCliAvailable()) throw new BridgeError('The Claude CLI is not installed on the bridge machine.', 503);
   const base = protocol === 'chat' ? body : responsesToChat(body);
   const tools = (base.tools || []).filter(t => t.function?.name || t.name);
@@ -82,6 +97,7 @@ export async function runClaudeCli({ body, protocol, route, effort, sink, signal
   // drive real tools on this machine.
   const args = ['-p', '--model', route.deployment, '--output-format', 'stream-json', '--include-partial-messages', '--verbose', '--max-turns', '1', '--strict-mcp-config', '--restricted', '--tools', '', '--system-prompt-file', systemFile];
   const cliEnv = { ...process.env, CLAUDE_CODE_DISABLE_AUTOUPDATE: '1' };
+  if (configDir) cliEnv.CLAUDE_CONFIG_DIR = configDir;
   if (route.deployment === 'claude-opus-5-5') {
     // Opus 5.5 always uses adaptive thinking; effort is its thinking control.
     args.push('--effort', effort || 'medium');
@@ -167,7 +183,7 @@ export async function runClaudeCli({ body, protocol, route, effort, sink, signal
         if (errorMessage && fullText && /max.?turns|Claude CLI request failed/i.test(errorMessage)) errorMessage = null;
         if (errorMessage) {
           const notLoggedIn = /not logged in|authentication/i.test(errorMessage);
-          reject(new BridgeError(notLoggedIn ? 'The Claude CLI is not logged in. Open the bridge app and use “Log in with Claude”.' : errorMessage, notLoggedIn ? 503 : 502));
+          reject(new BridgeError(notLoggedIn ? `The Claude account the bridge is set to use${configDir ? ` (${path.basename(configDir)})` : ''} is not logged in. Open the bridge app → Claude account and log in, or switch to another account.` : errorMessage, notLoggedIn ? 503 : 502));
         } else if (code !== 0 && !gotResult && !fullText) {
           reject(new BridgeError(`Claude CLI exited with code ${code}: ${stderrText.slice(0, 200)}`, 502));
         } else resolve();

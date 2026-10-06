@@ -6,7 +6,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { createSink, sendJson, sendOpenAIError, openSse } from './openai-protocol.mjs';
 import { BridgeError } from './errors.mjs';
 import { MODELS, routeModel, runAzure } from './azure-adapter.mjs';
-import { runClaudeCli } from './claude-cli-adapter.mjs';
+import { runClaudeCli, activeClaudeConfigDir } from './claude-cli-adapter.mjs';
 import { runChatgptCli } from './chatgpt-cli-adapter.mjs';
 import { settings, EFFORTS, resolveEffort, outputLimit, resolveServiceTier } from './model-settings.mjs';
 import { createTpmQueue } from './rate-limiter.mjs';
@@ -194,7 +194,7 @@ const server = http.createServer(async (req, res) => {
       started = Date.now();
       try { db.upsertRequest(entry); } catch {}
       const onThrottle = ms => { tpmQueue.pause(route.deployment, ms); if (route.tokensPerMinute > 0) { try { db.queueThrottle(route.id); } catch {} } };
-      if (route.protocol === 'claude-cli') await runClaudeCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir });
+      if (route.protocol === 'claude-cli') await runClaudeCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir, configDir: activeClaudeConfigDir(db, stateDir) });
       else if (route.protocol === 'chatgpt') await runChatgptCli({ body, protocol, route, effort, sink, signal: abort.signal, stateDir });
       else await runAzure({ body, protocol, route, key, endpoint, signal: abort.signal, sink, preferences, onThrottle, serviceTier });
     } finally { clearInterval(heartbeat); clearTimeout(holdOpen); }
